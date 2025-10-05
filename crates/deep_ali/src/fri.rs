@@ -468,6 +468,19 @@ fn indices_from_seed_r(seed: [u8; 32], n: usize, r: usize) -> Vec<usize> {
     out
 }
 
+/// Compute per-layer sizes from n0 and schedule: [N0, N1, ..., NL]
+fn layer_sizes_from_schedule(n0: usize, schedule: &[usize]) -> Vec<usize> {
+    let mut sizes = Vec::with_capacity(schedule.len() + 1);
+    let mut n = n0;
+    sizes.push(n);
+    for &m in schedule {
+        assert!(n % m == 0, "schedule must divide layer sizes");
+        n /= m;
+        sizes.push(n);
+    }
+    sizes
+}
+
 /// Per-layer commitment data bundled for building transcripts.
 #[derive(Clone)]
 pub struct FriLayerCommitment {
@@ -497,7 +510,7 @@ pub struct FriProverState {
     pub cp_layers: Vec<Vec<F>>,    // cp_ℓ vectors (cp_L is dummy zero)
     pub transcript: FriTranscript, // commitments for each layer
     pub omega_layers: Vec<F>,      // domain omega per layer (placeholder: same omega)
-    pub z_layers: Vec<F>,          // challenges per layer
+    pub z_layers: Vec<F>,          // challenges per layer (prover-side only)
 }
 
 /// Build FRI transcript: f layers, CP layers, combined-leaf commitments, and per-layer roots.
@@ -650,32 +663,58 @@ pub fn fri_prove_queries(
     (all_queries, roots)
 }
 
-/// Verifier: check r queries against per-layer roots and public parameters.
+/// Verifier: check r queries against per-layer roots and public parameters, with strict FS enforcement.
 pub fn fri_verify_queries(
     schedule: &[usize],
+    n0: usize,
     omega0: F,
-    z_layers: &[F],
+    seed_z: u64,
     roots: &[[u8; 32]],
     queries: &[FriQueryOpenings],
     r: usize,
 ) -> bool {
     let l = schedule.len();
-    if roots.len() != l + 1 || z_layers.len() != l {
+    if roots.len() != l + 1 {
         return false;
     }
 
-    // FS seed (not used for re-derivation in this simplified verifier)
-    let _fs_seed = fs_derive_seed("FRI/seed", roots);
+    // Compute layer sizes N_ell
+    let sizes = layer_sizes_from_schedule(n0, schedule);
+
+    // Derive and enforce z_ell from seed_z and N_ell
+    let mut z_layers = Vec::with_capacity(l);
+    for ell in 0..l {
+        let z = fri_sample_z_ell(seed_z, ell, sizes[ell]);
+        z_layers.push(z);
+    }
+
+    // Derive FS seed from roots (public)
+    let fs_seed = fs_derive_seed("FRI/seed", roots);
 
     // Placeholder omega per layer (same omega in our multiplicative placeholder)
     let omega_layers: Vec<F> = (0..l).map(|_| omega0).collect();
 
-    for qopen in queries.iter().take(r) {
+    for (q, qopen) in queries.iter().enumerate().take(r) {
         if qopen.per_layer.len() != l {
             return false;
         }
         for ell in 0..l {
             let lay = &qopen.per_layer[ell];
+
+            // Re-derive i_ell from FS seed and layer n, and enforce it equals proof position
+            let n = sizes[ell];
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"FRI/index");
+            hasher.update(&fs_seed);
+            hasher.update(&(ell as u64).to_le_bytes());
+            hasher.update(&(q as u64).to_le_bytes());
+            let seed = *hasher.finalize().as_bytes();
+            let derived_i = indices_from_seed_r(seed, n, 1)[0];
+
+            // Enforce the Merkle proof’s leaf_index matches derived_i and provided i
+            if lay.proof_i.leaf_index != derived_i || lay.i != derived_i {
+                return false;
+            }
 
             // Verify child leaf inclusion against roots[ell]
             if !Blake3Merkle::verify_leaf(roots[ell], &lay.leaf_i, &lay.proof_i) {
@@ -690,17 +729,21 @@ pub fn fri_verify_queries(
                     return false;
                 }
             }
-            // Verify parent inclusion
+            // Verify parent inclusion and mapping i_next = floor(i/m)
+            let m = schedule[ell];
+            let expected_parent_idx = derived_i / m;
+            if lay.parent_idx != expected_parent_idx {
+                return false;
+            }
             if !Blake3Merkle::verify_leaf(roots[ell + 1], &lay.parent_leaf, &lay.parent_proof) {
                 return false;
             }
 
-            // Check local CP/fold equation with opened data
-            let m = schedule[ell];
+            // Check local CP/fold equation with opened data, using re-derived z_ell
             let z = z_layers[ell];
             let omega = omega_layers[ell];
 
-            // Wrap roots in dummy commitments to reuse the arithmetic checker API
+            // Wrap roots in dummy commitments to reuse arithmetic checker API
             let child_commit = CombinedPoseidonCommitment {
                 root: roots[ell],
                 merkle: Blake3Merkle { root: roots[ell], nodes: vec![], n_leaves_pow2: 1 },
@@ -715,13 +758,13 @@ pub fn fri_verify_queries(
             let ok = verify_local_check_with_openings(
                 &child_commit,
                 &parent_commit,
-                lay.i,
+                derived_i,
                 lay.leaf_i,
                 &lay.proof_i,
                 &lay.neighbor_idx,
                 &lay.neighbor_leaves,
                 &lay.neighbor_proofs,
-                lay.parent_idx,
+                expected_parent_idx,
                 lay.parent_leaf,
                 &lay.parent_proof,
                 z,
@@ -733,7 +776,7 @@ pub fn fri_verify_queries(
             }
         }
 
-        // Final layer inclusion
+        // Final layer inclusion (index 0)
         if !Blake3Merkle::verify_leaf(roots[l], &qopen.final_leaf, &qopen.final_proof) {
             return false;
         }
@@ -792,7 +835,6 @@ pub struct DeepFriParams {
 /// Prover output: per-layer roots and query openings.
 pub struct DeepFriProof {
     pub roots: Vec<[u8; 32]>,
-    pub z_layers: Vec<F>,
     pub queries: Vec<FriQueryOpenings>,
     pub n0: usize,
     pub omega0: F,
@@ -827,25 +869,22 @@ pub fn deep_fri_prove<B: DeepAliBuilder>(
 
     DeepFriProof {
         roots,
-        z_layers: st.z_layers.clone(),
         queries,
         n0,
         omega0: domain0.omega,
     }
 }
 
-/// Verifier orchestrator: FS challenges → verify FRI queries.
+/// Verifier orchestrator: strict FS challenges → verify FRI queries.
 pub fn deep_fri_verify(
     params: &DeepFriParams,
     proof: &DeepFriProof,
 ) -> bool {
-    // In a full FS integration, the verifier would re-sample z_l from a transcript that includes roots.
-    // Here, we trust z_layers sent by the prover as they were derived from a public seed_z and domain sizes.
-    // If you want, we can enforce re-derivation: z_l = fri_sample_z_ell(seed_z, ell, N_ell).
     fri_verify_queries(
         &params.schedule,
+        proof.n0,
         proof.omega0,
-        &proof.z_layers,
+        params.seed_z,
         &proof.roots,
         &proof.queries,
         params.r,
@@ -986,8 +1025,8 @@ mod tests {
         let (queries, prover_roots) = fri_prove_queries(&st, r, fs_seed);
         assert_eq!(roots, prover_roots);
 
-        // Verify
-        let ok = fri_verify_queries(&schedule, omega0, &st.z_layers, &roots, &queries, r);
+        // Strict verify using re-derived z and indices
+        let ok = fri_verify_queries(&schedule, n0, omega0, seed_z, &roots, &queries, r);
         assert!(ok);
     }
 
@@ -1019,7 +1058,7 @@ mod tests {
             }
         }
 
-        let ok = fri_verify_queries(&schedule, omega0, &st.z_layers, &roots, &queries, r);
+        let ok = fri_verify_queries(&schedule, n0, omega0, seed_z, &roots, &queries, r);
         assert!(!ok, "verifier should reject corrupted opening");
     }
 
@@ -1059,5 +1098,30 @@ mod tests {
         let proof = deep_fri_prove(&DeepAliMock, &a, &s, &e, &t, n0, &params);
         let ok = deep_fri_verify(&params, &proof);
         assert!(ok);
+    }
+
+    #[test]
+    fn test_strict_fs_reject_wrong_index() {
+        // Verifier re-derives indices; tampering with i must be rejected.
+        let n0 = 128usize;
+        let schedule = vec![8usize, 8usize, 2usize];
+        let params = DeepFriParams { schedule: schedule.clone(), r: 8, seed_z: 0xABCDu64 };
+
+        let mut rng = StdRng::seed_from_u64(777);
+        let a: AliA = (0..8).map(|_| F::rand(&mut rng)).collect();
+        let s: AliS = (0..8).map(|_| F::rand(&mut rng)).collect();
+        let e: AliE = (0..8).map(|_| F::rand(&mut rng)).collect();
+        let t: AliT = (0..8).map(|_| F::rand(&mut rng)).collect();
+
+        let mut proof = deep_fri_prove(&DeepAliMock, &a, &s, &e, &t, n0, &params);
+
+        // Corrupt the first query's child index i (doesn't match FS re-derived index anymore)
+        if let Some(q) = proof.queries.get_mut(0) {
+            if let Some(lay) = q.per_layer.get_mut(0) {
+                lay.i = (lay.i + 1) % n0; // change the provided i
+            }
+        }
+        let ok = deep_fri_verify(&params, &proof);
+        assert!(!ok, "verifier must reject when i does not match FS-derived index");
     }
 }
