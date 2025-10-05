@@ -269,7 +269,6 @@ impl Mle {
                 layer[i] = one_minus * a + rv * b;
             }
             width = half;
-            // no need to zero tail; we will only read first `width` elements next round
             debug_assert_eq!(width, 1 << (self.k - (j + 1)));
         }
         layer[0]
@@ -299,7 +298,6 @@ impl<'a> MleProver<'a> {
 
     // Draw k challenges r_0..r_{k-1} from transcript using the provided label.
     pub fn draw_point(&mut self, label: &[u8]) -> Vec<F> {
-        // derive r_j as challenge(label || j)
         (0..self.mle.num_vars())
             .map(|j| {
                 let mut tag = Vec::with_capacity(label.len() + 8);
@@ -328,6 +326,10 @@ impl<'a> MleProver<'a> {
 
     pub fn inner_mut(&mut self) -> &mut MerkleProver<'a> {
         &mut self.merkle
+    }
+
+    pub fn mle(&self) -> &Mle {
+        &self.mle
     }
 }
 
@@ -375,11 +377,217 @@ impl<'a> MleVerifier<'a> {
     }
 }
 
+// -------------------------
+// Sum-check over MLE
+// -------------------------
+
+// Compute (c0, c1) so that g(t) = c0 + c1 * t, where
+// g(t) = sum over remaining variables of f with current fixed prefix and x_i = t.
+// When working over the full table layer, this is simply:
+// c0 = sum of pairs' left entries, c1 = sum of pairs' (right - left) entries.
+fn sumcheck_round_coeffs(layer: &[F]) -> (F, F) {
+    // layer length is power-of-two; represents current partial folding domain.
+    let mut c0 = F::from(0u64);
+    let mut c1 = F::from(0u64);
+    for i in (0..layer.len()).step_by(2) {
+        let a = layer[i];
+        let b = layer[i + 1];
+        c0 += a;
+        c1 += b - a;
+    }
+    (c0, c1)
+}
+
+pub struct SumCheckProver<'a> {
+    mle: MleProver<'a>,
+    // Working buffer used to fold the table per round
+    layer: Vec<F>,
+}
+
+pub struct SumCheckVerifier<'a> {
+    mle: MleVerifier<'a>,
+    rounds: usize,
+}
+
+impl<'a> SumCheckProver<'a> {
+    pub fn new(mut mle: MleProver<'a>) -> Self {
+        let layer = mle.mle().table().to_vec();
+        // Bind claimed sum S into transcript when provided later.
+        Self { mle, layer }
+    }
+
+    // Start the protocol by committing (already done outside) and sending the claim S.
+    // We bind S into the transcript as "SUMCHECK/CLAIM".
+    pub fn send_claim(&mut self) -> F {
+        let mut s = F::from(0u64);
+        for v in &self.layer {
+            s += *v;
+        }
+        self.mle
+            .inner_mut()
+            .chan
+            .transcript_mut()
+            .absorb_bytes(b"SUMCHECK/CLAIM");
+        self.mle.inner_mut().chan.transcript_mut().absorb_field(s);
+        s
+    }
+
+    // Run one round: compute g_i(t) = c0 + c1 t, send coefficients,
+    // derive r_i from transcript label, and fold layer by r_i.
+    pub fn round(&mut self, round_idx: usize, chal_label: &[u8]) -> (F, F, F) {
+        debug_assert!(self.layer.len() >= 2);
+        let (c0, c1) = sumcheck_round_coeffs(&self.layer);
+
+        // Bind coefficients into transcript in a labeled way
+        let t = self.mle.inner_mut().chan.transcript_mut();
+        t.absorb_bytes(b"SUMCHECK/ROUND");
+        t.absorb_bytes(&round_idx.to_le_bytes());
+        t.absorb_bytes(b"COEFF/c0");
+        t.absorb_field(c0);
+        t.absorb_bytes(b"COEFF/c1");
+        t.absorb_field(c1);
+
+        // Fiat–Shamir challenge r_i
+        let mut label = Vec::with_capacity(chal_label.len() + 8);
+        label.extend_from_slice(chal_label);
+        label.extend_from_slice(&(round_idx as u64).to_le_bytes());
+        let r_i = self.mle.inner_mut().chan.challenge_scalar(&label);
+
+        // Fold layer by r_i: layer'[j] = (1-r_i) * layer[2j] + r_i * layer[2j+1]
+        let one_minus = F::from(1u64) - r_i;
+        let mut j = 0usize;
+        for i in 0..(self.layer.len() / 2) {
+            let a = self.layer[j];
+            let b = self.layer[j + 1];
+            self.layer[i] = one_minus * a + r_i * b;
+            j += 2;
+        }
+        self.layer.truncate(self.layer.len() / 2);
+
+        (c0, c1, r_i)
+    }
+
+    // Finalize by sending the evaluation at r (already implied by the folded layer):
+    // After k rounds, layer has length 1 and equals f(r).
+    pub fn finalize_and_bind_eval(&mut self) -> F {
+        debug_assert_eq!(self.layer.len(), 1);
+        let val = self.layer[0];
+        self.mle
+            .inner_mut()
+            .chan
+            .transcript_mut()
+            .absorb_bytes(b"SUMCHECK/FINAL/EVAL");
+        self.mle.inner_mut().chan.transcript_mut().absorb_field(val);
+        val
+    }
+
+    pub fn mle_prover_mut(&mut self) -> &mut MleProver<'a> {
+        &mut self.mle
+    }
+}
+
+impl<'a> SumCheckVerifier<'a> {
+    pub fn new(mle: MleVerifier<'a>) -> Self {
+        let rounds = mle.k;
+        Self { mle, rounds }
+    }
+
+    // Receive and bind the claimed sum S.
+    pub fn recv_claim(&mut self, s: &F) {
+        let t = self.mle.inner_mut().chan.transcript_mut();
+        t.absorb_bytes(b"SUMCHECK/CLAIM");
+        t.absorb_field(*s);
+    }
+
+    // One round verification:
+    // - Verify g_i(0) + g_i(1) equals the running sum S_prev.
+    // - Derive r_i via FS using the same label scheme.
+    // - Update running sum to S := c0 + c1 * r_i.
+    pub fn round(
+        &mut self,
+        round_idx: usize,
+        s_prev: F,
+        c0: F,
+        c1: F,
+        chal_label: &[u8],
+    ) -> (F, F) {
+        // Bind coefficients (mirror prover)
+        let t = self.mle.inner_mut().chan.transcript_mut();
+        t.absorb_bytes(b"SUMCHECK/ROUND");
+        t.absorb_bytes(&round_idx.to_le_bytes());
+        t.absorb_bytes(b"COEFF/c0");
+        t.absorb_field(c0);
+        t.absorb_bytes(b"COEFF/c1");
+        t.absorb_field(c1);
+
+        // Check g(0) + g(1) = (c0) + (c0 + c1) = 2*c0 + c1
+        let lhs = F::from(2u64) * c0 + c1;
+        assert_eq!(lhs, s_prev, "sum-check round consistency failed");
+
+        // Challenge
+        let mut label = Vec::with_capacity(chal_label.len() + 8);
+        label.extend_from_slice(chal_label);
+        label.extend_from_slice(&(round_idx as u64).to_le_bytes());
+        let r_i = self.mle.inner_mut().chan.challenge_scalar(&label);
+
+        // Update claim
+        let s_next = c0 + c1 * r_i;
+        (r_i, s_next)
+    }
+
+    // Final check: bind the received final evaluation and assert it equals f(r) claim S_k.
+    pub fn finalize_and_check(&mut self, eval_at_r: F, s_k: F) {
+        let t = self.mle.inner_mut().chan.transcript_mut();
+        t.absorb_bytes(b"SUMCHECK/FINAL/EVAL");
+        t.absorb_field(eval_at_r);
+        assert_eq!(eval_at_r, s_k, "final sum-check evaluation mismatch");
+    }
+
+    pub fn mle_verifier_mut(&mut self) -> &mut MleVerifier<'a> {
+        &mut self.mle
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ark_ff::UniformRand;
     use rand::{rngs::StdRng, SeedableRng};
+
+    #[test]
+    fn e2e_merkle_channel_roundtrip() {
+        // Build transcripts with the same context label and params to match FS
+        let params = transcript::default_params();
+        let p_tr = Transcript::new(b"MERKLE-CHAN-E2E", params.clone());
+        let v_tr = Transcript::new(b"MERKLE-CHAN-E2E", params.clone());
+
+        let mut pchan = ProverChannel::new(p_tr);
+        let mut vchan = VerifierChannel::new(v_tr);
+
+        let ds_tag = F::from(2025u64);
+        let cfg = MerkleChannelCfg::with_default_params(ds_tag);
+
+        // Prover commits to a random table
+        let mut rng = StdRng::seed_from_u64(7);
+        let n = 55usize;
+        let table: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+
+        let mut prover = MerkleProver::new(&mut pchan, cfg.clone());
+        let root = prover.commit_vector(&table);
+
+        let mut verifier = MerkleVerifier::new(&mut vchan, cfg.clone());
+        verifier.receive_root(&root);
+
+        // Both sides derive the same challenge via FS
+        let alpha_p = prover.challenge_scalar(b"alpha");
+        let alpha_v = verifier.challenge_scalar(b"alpha");
+        assert_eq!(alpha_p, alpha_v);
+
+        // Prover opens a set of indices; verifier checks the opening
+        let indices = vec![0usize, 3, 7, 11, 54];
+        let (values, proof) = prover.open_indices(&indices, &table);
+        assert!(verifier.verify_openings(&indices, &values, &proof));
+    }
 
     #[test]
     fn e2e_mle_commit_eval_roundtrip() {
@@ -411,8 +619,8 @@ mod tests {
         mv.receive_root(&root);
 
         // Wrap in MLE helpers
-        let mut mle_prover = MleProver::new(mp, mlep.clone());
-        let mut mle_verifier = MleVerifier::new(mv, k);
+        let mut mle_prover = super::MleProver::new(mp, mlep.clone());
+        let mut mle_verifier = super::MleVerifier::new(mv, k);
 
         // Draw the same random point via transcript
         let r_p = mle_prover.draw_point(b"r");
@@ -430,5 +638,59 @@ mod tests {
 
         // Sanity: local evaluation matches direct evaluation
         assert_eq!(val, mlep.evaluate(&r_v));
+    }
+
+    #[test]
+    fn e2e_sumcheck_roundtrip() {
+        // transcripts
+        let params = transcript::default_params();
+        let p_tr = Transcript::new(b"SUMCHECK-E2E", params.clone());
+        let v_tr = Transcript::new(b"SUMCHECK-E2E", params.clone());
+        let mut pchan = ProverChannel::new(p_tr);
+        let mut vchan = VerifierChannel::new(v_tr);
+
+        // merkle cfg
+        let ds_tag = F::from(5050u64);
+        let cfg = MerkleChannelCfg::with_default_params(ds_tag);
+
+        // build an MLE with k = 6 (64 entries)
+        let mut rng = StdRng::seed_from_u64(42);
+        let k = 6usize;
+        let n = 1usize << k;
+        let table: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+
+        let mle = Mle::new(table.clone());
+
+        // Prover commit
+        let mut mp = MerkleProver::new(&mut pchan, cfg.clone());
+        let root = mp.commit_vector(&table);
+
+        // Verifier receives root
+        let mut mv = MerkleVerifier::new(&mut vchan, cfg.clone());
+        mv.receive_root(&root);
+
+        // Wrap in MLE helpers
+        let mle_p = MleProver::new(mp, mle.clone());
+        let mle_v = MleVerifier::new(mv, k);
+
+        let mut sp = SumCheckProver::new(mle_p);
+        let mut sv = SumCheckVerifier::new(mle_v);
+
+        // Prover sends claim S
+        let s = sp.send_claim();
+        sv.recv_claim(&s);
+
+        // Run k rounds
+        let mut running = s;
+        for i in 0..k {
+            let (c0, c1, r_i) = sp.round(i, b"sumcheck/r");
+            let (r_i_v, s_next) = sv.round(i, running, c0, c1, b"sumcheck/r");
+            assert_eq!(r_i, r_i_v, "challenge mismatch at round {}", i);
+            running = s_next;
+        }
+
+        // Final evaluation
+        let eval = sp.finalize_and_bind_eval();
+        sv.finalize_and_check(eval, running);
     }
 }
