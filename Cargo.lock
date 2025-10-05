@@ -869,6 +869,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "transcript"
+version = "0.1.0"
+dependencies = [
+ "ark-ff",
+ "ark-serialize",
+ "field",
+ "poseidon",
+ "serde",
+]
+
+[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
