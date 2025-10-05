@@ -507,12 +507,12 @@ pub fn fri_build_transcript(
     params: &FriProverParams,
 ) -> FriProverState {
     let schedule = params.schedule.clone();
-    let L = schedule.len();
+    let l = schedule.len();
 
     // Build f layers and z challenges
-    let mut f_layers = Vec::with_capacity(L + 1);
-    let mut z_layers = Vec::with_capacity(L);
-    let mut omega_layers = Vec::with_capacity(L);
+    let mut f_layers = Vec::with_capacity(l + 1);
+    let mut z_layers = Vec::with_capacity(l);
+    let mut omega_layers = Vec::with_capacity(l);
     let mut cur_f = f0;
     let mut cur_domain = domain0;
     f_layers.push(cur_f.clone());
@@ -528,25 +528,25 @@ pub fn fri_build_transcript(
         f_layers.push(cur_f.clone());
     }
 
-    // Compute CP layers for ℓ=0..L-1; cp_L dummy zeros
-    let mut cp_layers = Vec::with_capacity(L + 1);
-    for ell in 0..L {
+    // Compute CP layers for ℓ=0..l-1; cp_l dummy zeros
+    let mut cp_layers = Vec::with_capacity(l + 1);
+    for ell in 0..l {
         let m = schedule[ell];
         let z = z_layers[ell];
         let omega = omega_layers[ell];
         let cp = compute_cp_layer(&f_layers[ell], &f_layers[ell + 1], z, m, omega);
         cp_layers.push(cp);
     }
-    cp_layers.push(vec![F::zero(); f_layers[L].len()]); // final layer dummy
+    cp_layers.push(vec![F::zero(); f_layers[l].len()]); // final layer dummy
 
     // Build combined leaves and commitments per layer
-    let mut layers = Vec::with_capacity(L + 1);
-    for ell in 0..=L {
+    let mut layers = Vec::with_capacity(l + 1);
+    for ell in 0..=l {
         let leaves = build_combined_layer(&f_layers[ell], &cp_layers[ell]);
         let com = CombinedPoseidonCommitment::commit(&leaves);
         layers.push(FriLayerCommitment {
             n: leaves.len(),
-            m: if ell < L { schedule[ell] } else { 1 },
+            m: if ell < l { schedule[ell] } else { 1 },
             root: com.root,
             com,
             leaves,
@@ -590,13 +590,13 @@ pub fn fri_prove_queries(
     r: usize,
     fs_root_seed: [u8; 32],
 ) -> (Vec<FriQueryOpenings>, Vec<[u8; 32]>) {
-    let L = st.transcript.schedule.len();
+    let l = st.transcript.schedule.len();
     let mut all_queries = Vec::with_capacity(r);
 
     // For each query, sample per-layer index using a per-(ell,q) derived seed.
     for q in 0..r {
-        let mut per_layer = Vec::with_capacity(L);
-        for ell in 0..L {
+        let mut per_layer = Vec::with_capacity(l);
+        for ell in 0..l {
             let layer = &st.transcript.layers[ell];
             let n = layer.n;
 
@@ -637,7 +637,7 @@ pub fn fri_prove_queries(
         }
 
         // Final layer opening (constant or single element)
-        let last = &st.transcript.layers[L];
+        let last = &st.transcript.layers[l];
         let final_idx = 0usize;
         let final_leaf = last.leaves[final_idx];
         let final_proof = last.com.open(final_idx);
@@ -659,24 +659,22 @@ pub fn fri_verify_queries(
     queries: &[FriQueryOpenings],
     r: usize,
 ) -> bool {
-    let L = schedule.len();
-    if roots.len() != L + 1 || z_layers.len() != L {
+    let l = schedule.len();
+    if roots.len() != l + 1 || z_layers.len() != l {
         return false;
     }
 
-    // Derive FS seed from roots; we will not re-derive i explicitly here,
-    // because we did not pass layer sizes into this function.
-    // Security-wise, Merkle proofs bind indices, and tests focus on arithmetic/commitment correctness.
+    // FS seed (not used for re-derivation in this simplified verifier)
     let _fs_seed = fs_derive_seed("FRI/seed", roots);
 
     // Placeholder omega per layer (same omega in our multiplicative placeholder)
-    let omega_layers: Vec<F> = (0..L).map(|_| omega0).collect();
+    let omega_layers: Vec<F> = (0..l).map(|_| omega0).collect();
 
     for qopen in queries.iter().take(r) {
-        if qopen.per_layer.len() != L {
+        if qopen.per_layer.len() != l {
             return false;
         }
-        for ell in 0..L {
+        for ell in 0..l {
             let lay = &qopen.per_layer[ell];
 
             // Verify child leaf inclusion against roots[ell]
@@ -736,13 +734,125 @@ pub fn fri_verify_queries(
         }
 
         // Final layer inclusion
-        if !Blake3Merkle::verify_leaf(roots[L], &qopen.final_leaf, &qopen.final_proof) {
+        if !Blake3Merkle::verify_leaf(roots[l], &qopen.final_leaf, &qopen.final_proof) {
             return false;
         }
     }
 
     true
 }
+
+/* ===================== Milestone 8: DEEP-ALI + FRI Orchestrators ===================== */
+
+/// Placeholder aliases for DEEP-ALI inputs. In a real system these would be structured AIR objects.
+pub type AliA = Vec<F>;
+pub type AliS = Vec<F>;
+pub type AliE = Vec<F>;
+pub type AliT = Vec<F>;
+
+/// Build f0 from DEEP-ALI inputs. Trait so you can swap in a real builder later.
+pub trait DeepAliBuilder {
+    fn build_f0(&self, a: &AliA, s: &AliS, e: &AliE, t: &AliT, n0: usize, domain: FriDomain) -> Vec<F>;
+}
+
+/// A mock DEEP-ALI builder: deterministically hashes inputs into f0 length n0.
+#[derive(Clone, Default)]
+pub struct DeepAliMock;
+
+impl DeepAliBuilder for DeepAliMock {
+    fn build_f0(&self, a: &AliA, s: &AliS, e: &AliE, t: &AliT, n0: usize, _domain: FriDomain) -> Vec<F> {
+        // Derive a seed from the inputs using blake3, then expand with StdRng.
+        let mut h = blake3::Hasher::new();
+        let push = |h: &mut blake3::Hasher, v: &Vec<F>| {
+            for x in v {
+                let mut buf = [0u8; 32];
+                x.serialize_uncompressed(&mut buf[..]).unwrap();
+                h.update(&buf);
+            }
+        };
+        h.update(b"DEEP-ALI/mock");
+        push(&mut h, a);
+        push(&mut h, s);
+        push(&mut h, e);
+        push(&mut h, t);
+        let seed_bytes = *h.finalize().as_bytes();
+        let mut rng = StdRng::from_seed(seed_bytes);
+        (0..n0).map(|_| F::from(rng.gen::<u64>())).collect()
+    }
+}
+
+/// Public parameters for the full pipeline.
+#[derive(Clone)]
+pub struct DeepFriParams {
+    pub schedule: Vec<usize>, // e.g., [16,16,8]
+    pub r: usize,             // number of queries
+    pub seed_z: u64,          // seed for per-layer z_l challenges
+}
+
+/// Prover output: per-layer roots and query openings.
+pub struct DeepFriProof {
+    pub roots: Vec<[u8; 32]>,
+    pub z_layers: Vec<F>,
+    pub queries: Vec<FriQueryOpenings>,
+    pub n0: usize,
+    pub omega0: F,
+}
+
+/// Prover orchestrator: DEEP-ALI → f0 → FRI transcript → FS seed → queries.
+pub fn deep_fri_prove<B: DeepAliBuilder>(
+    builder: &B,
+    a: &AliA,
+    s: &AliS,
+    e: &AliE,
+    t: &AliT,
+    n0: usize,
+    params: &DeepFriParams,
+) -> DeepFriProof {
+    let domain0 = FriDomain::new_radix2(n0);
+    let f0 = builder.build_f0(a, s, e, t, n0, domain0);
+
+    // Build FRI transcript
+    let st = fri_build_transcript(f0, domain0, &FriProverParams {
+        schedule: params.schedule.clone(),
+        seed_z: params.seed_z,
+    });
+
+    // Derive FS seed from roots
+    let roots: Vec<[u8; 32]> = st.transcript.layers.iter().map(|l| l.root).collect();
+    let fs_seed = fs_derive_seed("FRI/seed", &roots);
+
+    // Prove r queries
+    let (queries, roots2) = fri_prove_queries(&st, params.r, fs_seed);
+    debug_assert_eq!(roots, roots2);
+
+    DeepFriProof {
+        roots,
+        z_layers: st.z_layers.clone(),
+        queries,
+        n0,
+        omega0: domain0.omega,
+    }
+}
+
+/// Verifier orchestrator: FS challenges → verify FRI queries.
+pub fn deep_fri_verify(
+    params: &DeepFriParams,
+    proof: &DeepFriProof,
+) -> bool {
+    // In a full FS integration, the verifier would re-sample z_l from a transcript that includes roots.
+    // Here, we trust z_layers sent by the prover as they were derived from a public seed_z and domain sizes.
+    // If you want, we can enforce re-derivation: z_l = fri_sample_z_ell(seed_z, ell, N_ell).
+    fri_verify_queries(
+        &params.schedule,
+        proof.omega0,
+        &proof.z_layers,
+        &proof.roots,
+        &proof.queries,
+        params.r,
+    )
+}
+
+/* ===================================== Tests ===================================== */
 
 #[cfg(test)]
 mod tests {
@@ -911,5 +1021,43 @@ mod tests {
 
         let ok = fri_verify_queries(&schedule, omega0, &st.z_layers, &roots, &queries, r);
         assert!(!ok, "verifier should reject corrupted opening");
+    }
+
+    #[test]
+    fn test_e2e_deep_ali_fri_roundtrip_small() {
+        // Small end-to-end: N=128, schedule (8,8,2), r=32
+        let n0 = 128usize;
+        let schedule = vec![8usize, 8usize, 2usize];
+        let params = DeepFriParams { schedule: schedule.clone(), r: 32, seed_z: 0xBEEFu64 };
+
+        // Mock DEEP-ALI inputs
+        let mut rng = StdRng::seed_from_u64(424242);
+        let a: AliA = (0..16).map(|_| F::rand(&mut rng)).collect();
+        let s: AliS = (0..16).map(|_| F::rand(&mut rng)).collect();
+        let e: AliE = (0..16).map(|_| F::rand(&mut rng)).collect();
+        let t: AliT = (0..16).map(|_| F::rand(&mut rng)).collect();
+
+        let proof = deep_fri_prove(&DeepAliMock, &a, &s, &e, &t, n0, &params);
+        let ok = deep_fri_verify(&params, &proof);
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_e2e_deep_ali_fri_roundtrip_large() {
+        // Larger end-to-end: N=2048, schedule (16,16,8), r=32
+        let n0 = 2048usize;
+        let schedule = vec![16usize, 16usize, 8usize];
+        let params = DeepFriParams { schedule: schedule.clone(), r: 32, seed_z: 0xDEAD_C0DEu64 };
+
+        // Mock DEEP-ALI inputs
+        let mut rng = StdRng::seed_from_u64(1234567);
+        let a: AliA = (0..64).map(|_| F::rand(&mut rng)).collect();
+        let s: AliS = (0..64).map(|_| F::rand(&mut rng)).collect();
+        let e: AliE = (0..64).map(|_| F::rand(&mut rng)).collect();
+        let t: AliT = (0..64).map(|_| F::rand(&mut rng)).collect();
+
+        let proof = deep_fri_prove(&DeepAliMock, &a, &s, &e, &t, n0, &params);
+        let ok = deep_fri_verify(&params, &proof);
+        assert!(ok);
     }
 }
