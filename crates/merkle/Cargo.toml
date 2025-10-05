@@ -1,0 +1,23 @@
+[package]
+name = "merkle"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+# If you want to serialize PoseidonParams later, you can add a feature to enable it.
+serde1 = []
+
+[dependencies]
+ark-ff = { workspace = true }
+ark-serialize = { workspace = true }   # needed for canonical (de)serialization of field elements
+serde = { workspace = true, features = ["derive"] }
+
+field = { path = "../field" }
+poseidon = { path = "../poseidon" }
+
+# Optional: for tests/examples
+rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }

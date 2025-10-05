@@ -1,0 +1,24 @@
+[package]
+name = "poly"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+# Optional serde derives for your own types (not required for ark types).
+serde1 = []
+
+[dependencies]
+# Inherit versions from the workspace root.
+ark-ff = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-poly = { workspace = true }
+ark-serialize = { workspace = true }
+
+# Optional serde for your types; gate with `serde1`.
+serde = { workspace = true, optional = true, features = ["derive"] }
+
+rand = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
