@@ -1,0 +1,16 @@
+[package]
+name = "channel"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+ark-ff = { workspace = true }
+field = { path = "../field" }
+commitment = { path = "../commitment" }
+serde = { version = "1", features = ["derive"] }
+poseidon = { path = "../poseidon" } # for params in tests or builders
+transcript = { path = "../transcript" } # adjust if your transcript lives elsewhere
+
+[dev-dependencies]
+rand = "0.8"

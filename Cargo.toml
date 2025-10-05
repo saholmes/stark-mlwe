@@ -10,6 +10,7 @@ members = [
     "crates/transcript",
     "crates/mle",
     "crates/commitment",
+    "crates/channel",
 ]
 resolver = "2"
 
