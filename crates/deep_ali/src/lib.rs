@@ -18,7 +18,7 @@ pub fn lagrange_eval_on_h(values: &[F], z: F, omega: F) -> F {
     let n = values.len();
     assert!(n > 0, "non-empty domain");
     if is_in_domain(z, n) {
-        // Exact evaluation on-grid by lookup
+        // Exact on-grid lookup
         let mut omega_j = F::one();
         for j in 0..n {
             if z == omega_j {
@@ -86,6 +86,106 @@ pub fn deep_ali_merge_evals(
     }
 
     (f0_eval, z, c_star)
+}
+
+/// Lightweight domain cache for H = <omega> (radix-2).
+/// Caches omega^j to reduce repeated work across evaluations/merges.
+#[derive(Clone)]
+pub struct DomainH {
+    pub n: usize,
+    pub omega: F,
+    pub omega_pows: Vec<F>, // [1, ω, ω^2, ..., ω^{n-1}]
+}
+
+impl DomainH {
+    /// Construct a radix-2 domain of size n and cache ω and its powers.
+    pub fn new_radix2(n: usize) -> Self {
+        use ark_poly::domain::radix2::Radix2EvaluationDomain as Domain;
+        use ark_poly::EvaluationDomain;
+        let dom = Domain::<F>::new(n).expect("radix-2 domain exists for this n");
+        let omega = dom.group_gen;
+
+        // Precompute omega^j
+        let mut omega_pows = Vec::with_capacity(n);
+        let mut x = F::one();
+        for _ in 0..n {
+            omega_pows.push(x);
+            x *= omega;
+        }
+
+        Self {
+            n,
+            omega,
+            omega_pows,
+        }
+    }
+
+    /// Evaluate the degree < n polynomial with values on H at z ∉ H (or exactly on H).
+    /// Uses the same formula as lagrange_eval_on_h but reuses cached omega powers.
+    pub fn eval_lagrange(&self, values: &[F], z: F) -> F {
+        assert_eq!(
+            values.len(),
+            self.n,
+            "values length must equal domain size"
+        );
+        if is_in_domain(z, self.n) {
+            for (j, &w) in self.omega_pows.iter().enumerate() {
+                if z == w {
+                    return values[j];
+                }
+            }
+            panic!("z in domain but not matching cached omega powers");
+        }
+
+        let zh = zh_at(z, self.n);
+        let n_inv = F::from(self.n as u64)
+            .inverse()
+            .expect("n invertible in prime field");
+
+        let mut sum = F::zero();
+        for j in 0..self.n {
+            let wj = self.omega_pows[j];
+            let inv = (z - wj).inverse().expect("z ∉ H");
+            sum += values[j] * wj * inv;
+        }
+        zh * n_inv * sum
+    }
+
+    /// DEEP-ALI merge reusing cached omega powers.
+    pub fn merge_deep_ali(
+        &self,
+        a_eval: &[F],
+        s_eval: &[F],
+        e_eval: &[F],
+        t_eval: &[F],
+        z: F,
+    ) -> (Vec<F>, F, F) {
+        assert_eq!(a_eval.len(), self.n);
+        assert_eq!(s_eval.len(), self.n);
+        assert_eq!(e_eval.len(), self.n);
+        assert_eq!(t_eval.len(), self.n);
+        assert!(!is_in_domain(z, self.n), "z must be outside H");
+
+        // Φ on H
+        let mut phi_eval = vec![F::zero(); self.n];
+        for i in 0..self.n {
+            phi_eval[i] = a_eval[i] * s_eval[i] + e_eval[i] - t_eval[i];
+        }
+
+        let phi_z = self.eval_lagrange(&phi_eval, z);
+        let zh_z = zh_at(z, self.n);
+        let c_star = phi_z * zh_z.inverse().expect("z ∉ H ⇒ Z_H(z) ≠ 0");
+
+        // f0 on H
+        let mut f0_eval = vec![F::zero(); self.n];
+        for j in 0..self.n {
+            f0_eval[j] = phi_eval[j] * (self.omega_pows[j] - z)
+                .inverse()
+                .expect("z ∉ H");
+        }
+
+        (f0_eval, z, c_star)
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +293,133 @@ mod tests {
             let left = f0_eval[j] * (x - z) + c_star * zh_x;
             assert_eq!(left, phi_x, "merged identity must hold at grid point {j}");
         }
+    }
+
+    #[test]
+    fn test_domainh_eval_and_merge_equivalence() {
+        // Compare DomainH methods with standalone functions.
+        let n = 16usize;
+        let domain = DomainH::new_radix2(n);
+        let omega = domain.omega;
+
+        let mut rng = StdRng::seed_from_u64(4242);
+        let deg = 10usize;
+        let coeffs: Vec<F> = (0..=deg).map(|_| F::rand(&mut rng)).collect();
+        let evals = eval_on_domain(&coeffs, omega, n);
+
+        // Deterministic z outside H
+        let z = F::from(2u64);
+        assert!(!is_in_domain(z, n));
+
+        let fz1 = lagrange_eval_on_h(&evals, z, omega);
+        let fz2 = domain.eval_lagrange(&evals, z);
+        assert_eq!(fz1, fz2, "DomainH::eval_lagrange must match standalone");
+
+        // Build A,S,E,T and compare merges
+        let deg_a = 7usize;
+        let deg_s = 9usize;
+        let deg_e = 5usize;
+        let a_coeffs: Vec<F> = (0..=deg_a).map(|_| F::rand(&mut rng)).collect();
+        let s_coeffs: Vec<F> = (0..=deg_s).map(|_| F::rand(&mut rng)).collect();
+        let e_coeffs: Vec<F> = (0..=deg_e).map(|_| F::rand(&mut rng)).collect();
+        let a_eval = eval_on_domain(&a_coeffs, omega, n);
+        let s_eval = eval_on_domain(&s_coeffs, omega, n);
+        let e_eval = eval_on_domain(&e_coeffs, omega, n);
+        let mut t_eval = vec![F::zero(); n];
+        for i in 0..n {
+            t_eval[i] = a_eval[i] * s_eval[i] + e_eval[i];
+        }
+
+        let (f0a, z1, c1) = deep_ali_merge_evals(&a_eval, &s_eval, &e_eval, &t_eval, omega, z);
+        let (f0b, z2, c2) = domain.merge_deep_ali(&a_eval, &s_eval, &e_eval, &t_eval, z);
+        assert_eq!(z1, z2);
+        assert_eq!(c1, c2);
+        assert_eq!(f0a, f0b);
+    }
+
+#[test]
+fn test_deterministic_z_edge_cases_small_n() {
+    for &n in &[8usize, 16usize] {
+        let domain = DomainH::new_radix2(n);
+        let omega = domain.omega;
+
+        // Deterministic z values: 2 and 3. Ensure they lie outside H for these small domains.
+        for &z in &[F::from(2u64), F::from(3u64)] {
+            if is_in_domain(z, n) {
+                continue;
+            }
+
+            let mut rng = StdRng::seed_from_u64(2025 + n as u64);
+            let deg = (n - 2).max(1);
+            let coeffs: Vec<F> = (0..=deg).map(|_| F::rand(&mut rng)).collect();
+            let evals = super::tests::eval_on_domain(&coeffs, omega, n);
+
+            let fz1 = lagrange_eval_on_h(&evals, z, omega);
+            let fz2 = domain.eval_lagrange(&evals, z);
+            assert_eq!(fz1, fz2, "consistent off-domain eval for small n");
+        }
+    }
+}
+    #[test]
+    fn test_multiple_merges_reuse_two_z() {
+        let n = 32usize;
+        let domain = DomainH::new_radix2(n);
+        let omega = domain.omega;
+
+        let mut rng = StdRng::seed_from_u64(9090);
+        let deg_a = 12usize;
+        let deg_s = 14usize;
+        let deg_e = 8usize;
+        let a_coeffs: Vec<F> = (0..=deg_a).map(|_| F::rand(&mut rng)).collect();
+        let s_coeffs: Vec<F> = (0..=deg_s).map(|_| F::rand(&mut rng)).collect();
+        let e_coeffs: Vec<F> = (0..=deg_e).map(|_| F::rand(&mut rng)).collect();
+
+        let a_eval = eval_on_domain(&a_coeffs, omega, n);
+        let s_eval = eval_on_domain(&s_coeffs, omega, n);
+        let e_eval = eval_on_domain(&e_coeffs, omega, n);
+        let mut t_eval = vec![F::zero(); n];
+        for i in 0..n {
+            t_eval[i] = a_eval[i] * s_eval[i] + e_eval[i];
+        }
+
+        // Two different z's off-domain
+        let z1 = F::from(2u64);
+        let z2 = F::from(3u64);
+        assert!(!is_in_domain(z1, n));
+        assert!(!is_in_domain(z2, n));
+
+        // Standalone
+        let (f0_1, _, c1) = deep_ali_merge_evals(&a_eval, &s_eval, &e_eval, &t_eval, omega, z1);
+        let (f0_2, _, c2) = deep_ali_merge_evals(&a_eval, &s_eval, &e_eval, &t_eval, omega, z2);
+
+        // DomainH
+        let (g0_1, _, d1) = domain.merge_deep_ali(&a_eval, &s_eval, &e_eval, &t_eval, z1);
+        let (g0_2, _, d2) = domain.merge_deep_ali(&a_eval, &s_eval, &e_eval, &t_eval, z2);
+
+        assert_eq!(f0_1, g0_1);
+        assert_eq!(f0_2, g0_2);
+        assert_eq!(c1, d1);
+        assert_eq!(c2, d2);
+    }
+
+    #[test]
+    fn test_degree_boundary_deg_n_minus_1() {
+        let n = 32usize;
+        let domain = DomainH::new_radix2(n);
+        let omega = domain.omega;
+
+        let mut rng = StdRng::seed_from_u64(4444);
+        // Degree n-1 is the maximum allowed for uniqueness over H (degree < n).
+        let deg = n - 1;
+        let coeffs: Vec<F> = (0..=deg).map(|_| F::rand(&mut rng)).collect();
+        let evals = eval_on_domain(&coeffs, omega, n);
+
+        // Off-domain z deterministic
+        let z = F::from(5u64);
+        assert!(!is_in_domain(z, n));
+
+        let fz1 = lagrange_eval_on_h(&evals, z, omega);
+        let fz2 = domain.eval_lagrange(&evals, z);
+        assert_eq!(fz1, fz2);
     }
 }
