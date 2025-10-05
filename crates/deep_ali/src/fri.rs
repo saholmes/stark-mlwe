@@ -1,8 +1,7 @@
-use ark_serialize::CanonicalSerialize;
 use ark_ff::{Field, One, Zero};
 use ark_pallas::Fr as F;
+use ark_serialize::CanonicalSerialize;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-
 
 /// FRI multiplicative domain descriptor.
 #[derive(Clone, Copy, Debug)]
@@ -31,7 +30,7 @@ pub struct PoseidonParamsPlaceholder;
 #[derive(Clone, Debug)]
 pub struct FriLayerParams {
     pub m: usize,                  // folding factor
-    pub width: usize,              // arity/coset width; equals m here
+    pub width: usize,              // equals m here
     pub poseidon_params: PoseidonParamsPlaceholder,
     pub level: usize,              // layer index ℓ
 }
@@ -48,7 +47,6 @@ impl FriLayerParams {
 }
 
 /// Deterministic per-layer challenge sampler based on a seed and "FRI/z/l" tag.
-/// In production, derive from a transcript; here we use a reproducible RNG.
 pub fn fri_sample_z_ell(seed: u64, level: usize, domain_size: usize) -> F {
     let mut rng = StdRng::seed_from_u64(seed ^ (0xF1F1_0000_0000_0000u64 + level as u64));
     loop {
@@ -60,15 +58,7 @@ pub fn fri_sample_z_ell(seed: u64, level: usize, domain_size: usize) -> F {
     }
 }
 
-/// Fold one FRI layer.
-/// Input: f_l over H_l (size N), folding factor m, challenge z_l.
-/// Output: f_{l+1} over reduced domain H_{l+1} of size N/m.
-///
-/// For this milestone, we define the fold as:
-/// - Partition f_l into chunks of size m: [v_0, ..., v_{m-1}] per bucket.
-/// - Output value is a simple linear combination with powers of z_l:
-///     g = sum_{i=0}^{m-1} v_i * z_l^i
-/// This is only a plumbing placeholder; real FRI uses a specific structured fold.
+/// Fold one FRI layer with placeholder linear comb by z^i.
 pub fn fri_fold_layer(f_l: &[F], z_l: F, m: usize) -> Vec<F> {
     assert!(m >= 2);
     assert!(f_l.len() % m == 0, "layer size must be divisible by m");
@@ -112,7 +102,7 @@ pub fn fri_fold_schedule(f0: Vec<F>, schedule: &[usize], seed: u64) -> Vec<Vec<F
     layers
 }
 
-/// A trivial commitment for testing: hash each field element with blake3.
+/// A trivial single-value commitment (legacy for milestone 5 tests) with blake3.
 #[derive(Clone, Debug)]
 pub struct FriCommitment {
     pub digests: Vec<[u8; 32]>,
@@ -141,6 +131,320 @@ impl FriCommitment {
     }
 }
 
+/// Combined leaf for layer ℓ: packs f_ℓ(i) and CP_ℓ(i).
+#[derive(Clone, Copy, Debug)]
+pub struct CombinedLeaf {
+    pub f: F,
+    pub cp: F,
+}
+
+/// A simple Merkle tree over CombinedLeaf using blake3 for both leaves and internal nodes.
+/// Leaves: H(b"L" || ser(f) || ser(cp))
+/// Nodes:  H(b"I" || left || right)
+fn hash_leaf_blake3(leaf: &CombinedLeaf) -> [u8; 32] {
+    let mut buf = [0u8; 1 + 64];
+    buf[0] = b'L';
+    leaf.f
+        .serialize_uncompressed(&mut buf[1..33])
+        .expect("ser f");
+    leaf.cp
+        .serialize_uncompressed(&mut buf[33..65])
+        .expect("ser cp");
+    *blake3::hash(&buf).as_bytes()
+}
+
+fn hash_node_blake3(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut buf = [0u8; 1 + 32 + 32];
+    buf[0] = b'I';
+    buf[1..33].copy_from_slice(&left);
+    buf[33..65].copy_from_slice(&right);
+    *blake3::hash(&buf).as_bytes()
+}
+
+/// Merkle tree storing all nodes for easy proof generation (dev/test friendly).
+#[derive(Clone)]
+pub struct Blake3Merkle {
+    pub root: [u8; 32],
+    pub nodes: Vec<[u8; 32]>, // binary tree, 1-indexed layout (index 0 unused)
+    pub n_leaves_pow2: usize,
+}
+
+/// Direction bit; left or right sibling
+#[derive(Clone, Copy)]
+pub enum Dir {
+    Left,
+    Right,
+}
+
+#[derive(Clone)]
+pub struct MerkleProof {
+    pub siblings: Vec<[u8; 32]>,
+    pub dirs: Vec<Dir>,
+    pub leaf_index: usize, // index in [0..n_leaves_pow2)
+}
+
+impl Blake3Merkle {
+    pub fn build(leaves: &[CombinedLeaf]) -> Self {
+        assert!(!leaves.is_empty());
+
+        let n = leaves.len();
+        let n_pow2 = n.next_power_of_two();
+        let total_nodes = 2 * n_pow2;
+        let mut nodes = vec![[0u8; 32]; total_nodes];
+
+        // Fill leaves with padding
+        let zero_leaf = CombinedLeaf { f: F::zero(), cp: F::zero() };
+        let zero_hash = hash_leaf_blake3(&zero_leaf);
+        for i in 0..n_pow2 {
+            let h = if i < n { hash_leaf_blake3(&leaves[i]) } else { zero_hash };
+            nodes[n_pow2 + i] = h;
+        }
+
+        // Build internal nodes
+        for idx in (1..n_pow2).rev() {
+            let left = nodes[idx * 2];
+            let right = nodes[idx * 2 + 1];
+            nodes[idx] = hash_node_blake3(left, right);
+        }
+
+        Self { root: nodes[1], nodes, n_leaves_pow2: n_pow2 }
+    }
+
+    pub fn open(&self, leaf_idx: usize) -> MerkleProof {
+        assert!(leaf_idx < self.n_leaves_pow2);
+        let mut idx = self.n_leaves_pow2 + leaf_idx;
+        let mut siblings = Vec::new();
+        let mut dirs = Vec::new();
+        while idx > 1 {
+            let is_right = (idx % 2) == 1;
+            let sib_idx = if is_right { idx - 1 } else { idx + 1 };
+            siblings.push(self.nodes[sib_idx]);
+            dirs.push(if is_right { Dir::Right } else { Dir::Left });
+            idx /= 2;
+        }
+        MerkleProof { siblings, dirs, leaf_index: leaf_idx }
+    }
+
+    pub fn verify_leaf(root: [u8; 32], leaf: &CombinedLeaf, proof: &MerkleProof) -> bool {
+        let mut cur = hash_leaf_blake3(leaf);
+        for (sib, dir) in proof.siblings.iter().zip(proof.dirs.iter()) {
+            cur = match dir {
+                Dir::Right => hash_node_blake3(*sib, cur),
+                Dir::Left => hash_node_blake3(cur, *sib),
+            };
+        }
+        cur == root
+    }
+}
+
+/// Commitment over combined leaves using the Blake3 Merkle (placeholder for Poseidon).
+#[derive(Clone)]
+pub struct CombinedPoseidonCommitment {
+    pub root: [u8; 32],
+    pub merkle: Blake3Merkle,
+    pub leaves_len: usize, // actual number of data leaves
+}
+
+impl CombinedPoseidonCommitment {
+    pub fn commit(values: &[CombinedLeaf]) -> Self {
+        let merkle = Blake3Merkle::build(values);
+        Self { root: merkle.root, merkle, leaves_len: values.len() }
+    }
+
+    pub fn open(&self, i: usize) -> MerkleProof {
+        assert!(i < self.leaves_len);
+        self.merkle.open(i)
+    }
+
+    pub fn verify(&self, i: usize, value: CombinedLeaf, proof: &MerkleProof) -> bool {
+        proof.leaf_index == i && Blake3Merkle::verify_leaf(self.root, &value, proof)
+    }
+}
+
+/// Compute CP_ℓ for a layer:
+/// - Fold residual per bucket b: R_b = sum_{t=0..m-1} f_l[b*m + t] z_l^t - f_{l+1}(b)
+/// - Let w_i = omega_l^i. Define CP_l(i) = R_b / (z_l - w_i).
+/// This is zero iff fold residual = 0 since z_l ∉ H_l.
+pub fn compute_cp_layer(
+    f_l: &[F],
+    f_l_plus_1: &[F],
+    z_l: F,
+    m: usize,
+    omega_l: F,
+) -> Vec<F> {
+    assert!(f_l.len() % m == 0, "size must be divisible by m");
+    let n = f_l.len();
+    let n_next = n / m;
+    assert_eq!(f_l_plus_1.len(), n_next, "f_l_plus_1 length mismatch");
+
+    // Precompute z powers and omega powers
+    let mut z_pows = Vec::with_capacity(m);
+    let mut acc = F::one();
+    for _ in 0..m {
+        z_pows.push(acc);
+        acc *= z_l;
+    }
+
+    let mut omega_pows = Vec::with_capacity(n);
+    let mut w = F::one();
+    for _ in 0..n {
+        omega_pows.push(w);
+        w *= omega_l;
+    }
+
+    // Compute residual per bucket
+    let mut residuals = vec![F::zero(); n_next];
+    for b in 0..n_next {
+        let base = b * m;
+        let mut s = F::zero();
+        for t in 0..m {
+            s += f_l[base + t] * z_pows[t];
+        }
+        residuals[b] = s - f_l_plus_1[b];
+    }
+
+    // Map per index i: CP(i) = residual(b) / (z - w_i)
+    let mut cp = vec![F::zero(); n];
+    for i in 0..n {
+        let b = i / m;
+        let denom = z_l - omega_pows[i];
+        let inv = denom
+            .inverse()
+            .expect("z_l not in H_l ⇒ denominators nonzero");
+        cp[i] = residuals[b] * inv;
+    }
+    cp
+}
+
+/// Build combined leaves for a layer.
+pub fn build_combined_layer(f_l: &[F], cp_l: &[F]) -> Vec<CombinedLeaf> {
+    assert_eq!(f_l.len(), cp_l.len());
+    f_l.iter()
+        .zip(cp_l.iter())
+        .map(|(&f, &cp)| CombinedLeaf { f, cp })
+        .collect()
+}
+
+/// Open all neighbors in the bucket of index i (excluding i) for fold verification.
+/// Returns neighbor CombinedLeaf values and their proofs.
+pub fn open_bucket_neighbors(
+    commitment: &CombinedPoseidonCommitment,
+    leaves: &[CombinedLeaf],
+    i: usize,
+    m: usize,
+) -> (Vec<usize>, Vec<CombinedLeaf>, Vec<MerkleProof>) {
+    let n = leaves.len();
+    assert!(n % m == 0);
+    let b = i / m;
+    let base = b * m;
+    let mut idxs = Vec::with_capacity(m - 1);
+    let mut vals = Vec::with_capacity(m - 1);
+    let mut proofs = Vec::with_capacity(m - 1);
+    for t in 0..m {
+        let j = base + t;
+        if j == i {
+            continue;
+        }
+        idxs.push(j);
+        vals.push(leaves[j]);
+        let proof = commitment.open(j);
+        proofs.push(proof);
+    }
+    (idxs, vals, proofs)
+}
+
+/// Verify local check for a single index i at layer ℓ using only opened data.
+/// Inputs:
+/// - child_commit: commitment for layer ℓ
+/// - parent_commit: commitment for layer ℓ+1
+/// - leaf_i: combined leaf at i with its proof (from child_commit)
+/// - neighbors: combined leaves for other entries in the bucket with proofs (from child_commit)
+/// - parent_leaf: combined leaf at i_next with proof (from parent_commit)
+/// - public params: z_l, m, omega_l
+pub fn verify_local_check_with_openings(
+    child_commit: &CombinedPoseidonCommitment,
+    parent_commit: &CombinedPoseidonCommitment,
+    i: usize,
+    leaf_i: CombinedLeaf,
+    proof_i: &MerkleProof,
+    neighbor_indices: &[usize],
+    neighbor_leaves: &[CombinedLeaf],
+    neighbor_proofs: &[MerkleProof],
+    parent_idx: usize,
+    parent_leaf: CombinedLeaf,
+    parent_proof: &MerkleProof,
+    z_l: F,
+    m: usize,
+    omega_l: F,
+) -> bool {
+    // 1) Verify Merkle inclusion for i and neighbors at child layer, and parent at parent layer
+    if !child_commit.verify(i, leaf_i, proof_i) {
+        return false;
+    }
+    if neighbor_indices.len() != neighbor_leaves.len()
+        || neighbor_indices.len() != neighbor_proofs.len()
+    {
+        return false;
+    }
+    for ((&j, &leaf_j), pf) in neighbor_indices
+        .iter()
+        .zip(neighbor_leaves.iter())
+        .zip(neighbor_proofs.iter())
+    {
+        if pf.leaf_index != j {
+            return false;
+        }
+        if !child_commit.verify(j, leaf_j, pf) {
+            return false;
+        }
+    }
+    if !parent_commit.verify(parent_idx, parent_leaf, parent_proof) {
+        return false;
+    }
+
+    // 2) Check fold equation using the m values in the bucket
+    let b = i / m;
+    if parent_idx != b {
+        return false;
+    }
+
+    // Gather all f's in the bucket, including f_i
+    let base = b * m;
+    let mut fs = vec![F::zero(); m];
+    for (&j, &leaf_j) in neighbor_indices.iter().zip(neighbor_leaves.iter()) {
+        let t = j - base;
+        if t >= m {
+            return false;
+        }
+        fs[t] = leaf_j.f;
+    }
+    // Set the queried index position
+    let t_i = i - base;
+    fs[t_i] = leaf_i.f;
+
+    // Compute RHS: sum_t fs[t] * z^t
+    let mut z_pows = Vec::with_capacity(m);
+    let mut acc = F::one();
+    for _ in 0..m {
+        z_pows.push(acc);
+        acc *= z_l;
+    }
+    let mut rhs = F::zero();
+    for t in 0..m {
+        rhs += fs[t] * z_pows[t];
+    }
+
+    // Compute w_i = omega^i
+    let mut w_i = F::one();
+    for _ in 0..i {
+        w_i *= omega_l;
+    }
+
+    // Check cp(i)*(z - w_i) + f_{l+1}(b) == sum fs[t] z^t
+    let lhs = leaf_i.cp * (z_l - w_i) + parent_leaf.f;
+    lhs == rhs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,7 +471,7 @@ mod tests {
         assert_eq!(layers[3].len(), n3);
     }
 
-   #[test]
+    #[test]
     fn test_layer_commit_open_basic() {
         let n0 = 4096usize; // divisible by 16*16*8 = 2048
         let schedule = [16usize, 16usize, 8usize];
@@ -176,7 +480,7 @@ mod tests {
         let f0: Vec<F> = (0..n0).map(|_| F::rand(&mut rng)).collect();
         let layers = fri_fold_schedule(f0.clone(), &schedule, 0xBAD5EED);
 
-        // For each layer, commit and verify a few random indices.
+        // For each layer, commit and verify a few random indices using legacy blake3 single-value
         for (ell, f) in layers.iter().enumerate() {
             let com = FriCommitment::commit(f);
 
@@ -185,9 +489,69 @@ mod tests {
             for _ in 0..5 {
                 let idx = (rngp.gen::<usize>() % f.len()).min(f.len().saturating_sub(1));
                 assert!(com.verify(idx, f[idx]));
+                // Check exact digest match
                 let opened = com.open(idx);
                 assert_eq!(opened, com.digests[idx]);
             }
+        }
+    }
+
+    #[test]
+    fn test_combined_layer_poseidon_merkle_roundtrip_and_local_verify() {
+        // Build combined leaves, commit with Merkle, open minimal set and verify local check
+        let n0 = 1024usize;
+        let m = 16usize;
+        let domain = FriDomain::new_radix2(n0);
+        let omega0 = domain.omega;
+
+        let mut rng = StdRng::seed_from_u64(1212);
+        let f0: Vec<F> = (0..n0).map(|_| F::rand(&mut rng)).collect();
+        let z0 = fri_sample_z_ell(0xDEAD_BEEF, 0, n0);
+        let f1 = fri_fold_layer(&f0, z0, m);
+        let cp0 = compute_cp_layer(&f0, &f1, z0, m, omega0);
+
+        let leaves0 = build_combined_layer(&f0, &cp0);
+        let com0 = CombinedPoseidonCommitment::commit(&leaves0);
+
+        // Parent layer combined leaves too (only f is used by local check here)
+        let cp1_dummy = vec![F::zero(); f1.len()];
+        let leaves1 = build_combined_layer(&f1, &cp1_dummy);
+        let com1 = CombinedPoseidonCommitment::commit(&leaves1);
+
+        // Query random positions and verify with Merkle proofs and neighbor openings
+        let mut rngq = StdRng::seed_from_u64(333);
+        for _ in 0..10 {
+            let i = rngq.gen::<usize>() % n0;
+            let leaf_i = leaves0[i];
+            let proof_i = com0.open(i);
+
+            // Open neighbors in bucket (child layer)
+            let (neighbor_idx, neighbor_leaves, neighbor_proofs) =
+                open_bucket_neighbors(&com0, &leaves0, i, m);
+
+            // Parent index and opening (parent layer)
+            let b = i / m;
+            let parent_leaf = leaves1[b];
+            let parent_proof = com1.open(b);
+
+            // Verify using both commitments
+            let ok = verify_local_check_with_openings(
+                &com0,
+                &com1,
+                i,
+                leaf_i,
+                &proof_i,
+                &neighbor_idx,
+                &neighbor_leaves,
+                &neighbor_proofs,
+                b,
+                parent_leaf,
+                &parent_proof,
+                z0,
+                m,
+                omega0,
+            );
+            assert!(ok, "local verification failed at i={}", i);
         }
     }
 }

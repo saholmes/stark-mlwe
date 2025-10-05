@@ -11,6 +11,7 @@ ark-ff = "0.4"
 ark-poly = "0.4"
 ark-pallas = "0.4"
 ark-serialize = "0.4"
+ark-sponge = { version = "0.4.0-alpha" }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 blake3 = "1.5"
 
@@ -19,5 +20,6 @@ ark-ff = "0.4"
 ark-poly = "0.4"
 ark-pallas = "0.4"
 ark-serialize = "0.4"
+ark-sponge = { version = "0.4.0-alpha" }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 blake3 = "1.5"
