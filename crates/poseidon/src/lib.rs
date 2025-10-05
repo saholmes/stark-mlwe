@@ -8,7 +8,9 @@ pub const T: usize = 17;       // state width = rate(16) + capacity(1)
 pub const RATE: usize = 16;
 pub const CAPACITY: usize = 1;
 pub const RF: usize = 8;       // number of full rounds (total)
-pub const RP: usize = 64;      // number of partial rounds
+pub const RP: usize = 64;      // number of partial rounds (t=17)
+// For t=9 use RP_9 = 60.
+pub const RP_9: usize = 60;
 pub const ALPHA: u64 = 5;      // S-box x^5
 
 #[derive(Clone)]
@@ -40,7 +42,7 @@ pub fn permute(state: &mut [F; T], params: &PoseidonParams) {
             state[i] = sbox5(state[i]);
         }
         // MDS linear layer
-        *state = mds_mul(&params.mds, state);
+        *state = mds_mul_fixed(&params.mds, state);
     }
 
     // Partial rounds
@@ -50,7 +52,7 @@ pub fn permute(state: &mut [F; T], params: &PoseidonParams) {
         // S-box on first element
         state[0] = sbox5(state[0]);
         // MDS
-        *state = mds_mul(&params.mds, state);
+        *state = mds_mul_fixed(&params.mds, state);
     }
 
     // Second half full rounds
@@ -61,12 +63,12 @@ pub fn permute(state: &mut [F; T], params: &PoseidonParams) {
         for i in 0..T {
             state[i] = sbox5(state[i]);
         }
-        *state = mds_mul(&params.mds, state);
+        *state = mds_mul_fixed(&params.mds, state);
     }
 }
 
-// Multiply state vector by MDS matrix: out = M * state
-fn mds_mul(mds: &[[F; T]; T], state: &[F; T]) -> [F; T] {
+// Multiply state vector by MDS matrix: out = M * state (fixed T)
+fn mds_mul_fixed(mds: &[[F; T]; T], state: &[F; T]) -> [F; T] {
     let mut out = [F::zero(); T];
     for i in 0..T {
         let mut acc = F::zero();
@@ -78,7 +80,7 @@ fn mds_mul(mds: &[[F; T]; T], state: &[F; T]) -> [F; T] {
     out
 }
 
-// Public hashing API: absorb chunks with domain-separation tag in capacity slot.
+// Public hashing API (fixed width): absorb chunks with DS tag in capacity slot.
 // Returns the first state element as digest.
 pub fn hash_with_ds(inputs: &[F], ds_tag: F, params: &PoseidonParams) -> F {
     let mut state = [F::zero(); T];
@@ -94,6 +96,195 @@ pub fn hash_with_ds(inputs: &[F], ds_tag: F, params: &PoseidonParams) -> F {
         permute(&mut state, params);
     }
 
+    state[0]
+}
+
+// ========= Milestone 1 additions: dynamic width support and params builder =========
+
+#[derive(Clone, Debug)]
+pub struct PoseidonParamsDynamic {
+    pub t: usize,                 // state width
+    pub rate: usize,              // rate = t - 1 (capacity = 1)
+    pub rounds_full: usize,       // RF = 8
+    pub rounds_partial: usize,    // RP = 64 (t=17) or 60 (t=9)
+    pub alpha: u64,               // 5
+    pub mds: Vec<Vec<F>>,         // t x t
+    pub rc_full: Vec<Vec<F>>,     // RF x t
+    pub rc_partial: Vec<F>,       // RP elements
+}
+
+/// Build Poseidon parameters for width t with alpha=5, RF=8, RP in {64,60}.
+/// Supported widths: t = 17 (m=16), t = 9 (m=8).
+/// Uses deterministic fr_from_hash-based derivation for stability.
+/// Swap in audited constants when ready without changing the signature.
+pub fn poseidon_params_for_width(t: usize) -> PoseidonParamsDynamic {
+    let (rf, rp) = match t {
+        17 => (8usize, 64usize),
+        9 => (8usize, 60usize),
+        _ => panic!("unsupported Poseidon width t={t}; supported t ∈ {{17, 9}}"),
+    };
+    let rate = t - 1;
+    let seed = seed_for_t(t);
+
+    let mds = derive_mds(&seed, t);
+    let rc_full = derive_rc_full(&seed, rf, t);
+    let rc_partial = derive_rc_partial(&seed, rp);
+
+    PoseidonParamsDynamic {
+        t,
+        rate,
+        rounds_full: rf,
+        rounds_partial: rp,
+        alpha: 5,
+        mds,
+        rc_full,
+        rc_partial,
+    }
+}
+
+fn seed_for_t(t: usize) -> Vec<u8> {
+    // Distinct seeds per width to avoid accidental collisions.
+    let mut s = Vec::new();
+    s.extend_from_slice(b"POSEIDON-PALLAS-T");
+    s.extend_from_slice(&(t as u64).to_le_bytes());
+    s
+}
+
+fn derive_mds(seed: &[u8], t: usize) -> Vec<Vec<F>> {
+    let mut m = vec![vec![F::zero(); t]; t];
+    for i in 0..t {
+        for j in 0..t {
+            let tag = "POSEIDON-MDS";
+            let mut data = Vec::with_capacity(seed.len() + 16);
+            data.extend_from_slice(&(i as u64).to_le_bytes());
+            data.extend_from_slice(&(j as u64).to_le_bytes());
+            data.extend_from_slice(seed);
+            m[i][j] = fr_from_hash(tag, &data);
+        }
+    }
+    m
+}
+
+fn derive_rc_full(seed: &[u8], rf: usize, t: usize) -> Vec<Vec<F>> {
+    let mut rc = vec![vec![F::zero(); t]; rf];
+    for r in 0..rf {
+        for i in 0..t {
+            let tag = "POSEIDON-RC-FULL";
+            let mut data = Vec::with_capacity(seed.len() + 16);
+            data.extend_from_slice(&(r as u64).to_le_bytes());
+            data.extend_from_slice(&(i as u64).to_le_bytes());
+            data.extend_from_slice(seed);
+            rc[r][i] = fr_from_hash(tag, &data);
+        }
+    }
+    rc
+}
+
+fn derive_rc_partial(seed: &[u8], rp: usize) -> Vec<F> {
+    let mut rc = vec![F::zero(); rp];
+    for r in 0..rp {
+        let tag = "POSEIDON-RC-PART";
+        let mut data = Vec::with_capacity(seed.len() + 8);
+        data.extend_from_slice(&(r as u64).to_le_bytes());
+        data.extend_from_slice(seed);
+        rc[r] = fr_from_hash(tag, &data);
+    }
+    rc
+}
+
+/// Generic permutation for dynamic params (t ∈ {9, 17}).
+pub fn permute_dynamic(state: &mut [F], params: &PoseidonParamsDynamic) {
+    let t = params.t;
+    assert_eq!(state.len(), t);
+
+    let rf = params.rounds_full;
+    let rp = params.rounds_partial;
+    let rf_half = rf / 2;
+
+    // First half full rounds
+    for r in 0..rf_half {
+        // ARK
+        for i in 0..t {
+            state[i] += params.rc_full[r][i];
+        }
+        // Full S-box
+        for i in 0..t {
+            state[i] = sbox5(state[i]);
+        }
+        // MDS
+        mds_mul_dynamic_in_place(&params.mds, state);
+    }
+
+    // Partial rounds (S-box on lane 0)
+    for r in 0..rp {
+        state[0] += params.rc_partial[r];
+        state[0] = sbox5(state[0]);
+        mds_mul_dynamic_in_place(&params.mds, state);
+    }
+
+    // Second half full rounds
+    for r in rf_half..rf {
+        for i in 0..t {
+            state[i] += params.rc_full[r][i];
+        }
+        for i in 0..t {
+            state[i] = sbox5(state[i]);
+        }
+        mds_mul_dynamic_in_place(&params.mds, state);
+    }
+}
+
+fn mds_mul_dynamic_in_place(mds: &[Vec<F>], state: &mut [F]) {
+    let t = state.len();
+    debug_assert_eq!(mds.len(), t);
+    let mut out = vec![F::zero(); t];
+    for i in 0..t {
+        let mut acc = F::zero();
+        for j in 0..t {
+            acc += mds[i][j] * state[j];
+        }
+        out[i] = acc;
+    }
+    state.copy_from_slice(&out);
+}
+
+/// Absorb one element into the sponge rate; permute when the rate is full.
+#[inline]
+fn absorb_one(x: F, state: &mut [F], cursor: &mut usize, rate: usize, params: &PoseidonParamsDynamic) {
+    state[*cursor] += x;
+    *cursor += 1;
+    if *cursor == rate {
+        *cursor = 0;
+        permute_dynamic(state, params);
+    }
+}
+
+/// DS-friendly hash for dynamic widths (rate = t-1, capacity=1).
+/// Absorbs ds_fields first, then inputs (children) in order, padding with 1 then 0s.
+/// Returns state[0] as the digest.
+pub fn hash_with_ds_dynamic(ds_fields: &[F], inputs: &[F], params: &PoseidonParamsDynamic) -> F {
+    let t = params.t;
+    let rate = params.rate;
+    assert_eq!(rate + 1, t);
+
+    let mut state = vec![F::zero(); t];
+    let mut cursor = 0usize;
+
+    // Absorb DS preamble
+    for &x in ds_fields {
+        absorb_one(x, &mut state, &mut cursor, rate, params);
+    }
+    // Absorb message/children
+    for &x in inputs {
+        absorb_one(x, &mut state, &mut cursor, rate, params);
+    }
+    // Padding: 1 then zeros until block boundary
+    absorb_one(F::from(1u64), &mut state, &mut cursor, rate, params);
+    while cursor != 0 {
+        absorb_one(F::zero(), &mut state, &mut cursor, rate, params);
+    }
+
+    // Squeeze first element
     state[0]
 }
 

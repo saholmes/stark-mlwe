@@ -1,19 +1,21 @@
-//! field crate: utilities around the BLS12-381 scalar field (Fr).
+//! field crate: utilities around the Pallas scalar field (Fr).
 //!
 //! Key points:
 //! - No serde feature on ark-ff (0.5.x).
 //! - Optional serde derives for your own types via the "serde1" feature.
 //! - Prefer ark_serialize for canonical binary I/O of field elements.
+//! - F is the Pallas scalar field: ark_pallas::Fr.
+//!
+//! Domain helpers:
+//! - make_domain_2048() returns a primitive 2048-th root of unity (omega) and N=2048,
+//!   with exact-order checks.
 
 pub use ark_pallas::Fr as F;
-use ark_ff::{Field, FftField, One, Zero};
+use ark_ff::{BigInteger, Field, FftField, One, PrimeField, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 
 #[cfg(feature = "serde1")]
 use serde::{Deserialize, Serialize};
-
-/// Re-export the field type so users can depend on this crate for the field alias.
-/// pub type F = Fr;
 
 /// A simple multiplicative subgroup domain of size n = 2^log_n.
 /// Stores the generator (omega) and optionally precomputes the elements.
@@ -40,7 +42,7 @@ impl Domain {
     /// does not exist in the field (should exist for Fr for reasonable sizes).
     pub fn new(log_n: usize) -> Option<Self> {
         let size = 1usize << log_n;
-        // FftField::get_root_of_unity expects the size as a power-of-two exponent
+        // F::get_root_of_unity expects the size (power-of-two).
         let omega = F::get_root_of_unity(size as u64)?;
         Some(Self {
             size,
@@ -130,6 +132,73 @@ pub fn compute_powers(base: F, n: usize) -> Vec<F> {
     v
 }
 
+/// Construct the canonical size-2048 multiplicative subgroup H in F.
+///
+/// Returns (omega, N) where:
+/// - N = 2048
+/// - omega is a primitive N-th root of unity (exact order N)
+///
+/// Guarantees:
+/// - omega^N == 1
+/// - omega^(N/2) != 1
+///
+/// Panics if such a root cannot be constructed (should not happen for Pallas Fr).
+pub fn make_domain_2048() -> (F, usize) {
+    const N: usize = 2048;
+
+    // Try direct root-of-unity for N.
+    if let Some(omega) = F::get_root_of_unity(N as u64) {
+        debug_assert!(pow_eq_one(&omega, N));
+        debug_assert!(!pow_eq_one(&omega, N / 2));
+        return (omega, N);
+    }
+
+    // Fallback: derive from the maximal 2^t root where t = TWO_ADICITY.
+    let t = F::TWO_ADICITY as usize;
+    assert!(
+        t >= 11,
+        "Pallas Fr must have two-adicity >= 11 for a size-2048 domain"
+    );
+
+    let max_n = 1usize << t;
+    let max_root = F::get_root_of_unity(max_n as u64)
+        .expect("Field should provide a 2^t root of unity for its two-adicity");
+    // Downscale to order 2^11: omega = max_root^(2^t / 2^11)
+    let step = (max_n / N) as u64;
+    let omega = max_root.pow([step]);
+
+    // Exact-order checks
+    assert!(pow_eq_one(&omega, N), "omega^N must be 1");
+    assert!(
+        !pow_eq_one(&omega, N / 2),
+        "omega must have exact order N (omega^(N/2) != 1)"
+    );
+
+    (omega, N)
+}
+
+/// Return true iff x^n == 1.
+fn pow_eq_one(x: &F, n: usize) -> bool {
+    pow(x, n).is_one()
+}
+
+/// Efficient exponentiation: x^n (n is a non-negative usize).
+fn pow(x: &F, n: usize) -> F {
+    // Binary exponentiation
+    let mut acc = F::one();
+    let mut base = *x;
+    let mut e = n as u64;
+
+    while e > 0 {
+        if e & 1 == 1 {
+            acc *= base;
+        }
+        base.square_in_place();
+        e >>= 1;
+    }
+    acc
+}
+
 /// Example helpers showing how to use ark_serialize for canonical I/O.
 /// These serialize a single field element to bytes and back.
 
@@ -148,6 +217,7 @@ pub fn fr_from_bytes_compressed(bytes: &[u8]) -> Result<F, ark_serialize::Serial
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_domain_basic() {
@@ -183,5 +253,28 @@ mod tests {
         let bytes = fr_to_bytes_compressed(&x);
         let y = fr_from_bytes_compressed(&bytes).expect("deserialize");
         assert_eq!(x, y);
+    }
+
+    #[test]
+    fn test_domain_2048_ok() {
+        let (omega, n) = make_domain_2048();
+        assert_eq!(n, 2048);
+
+        // Exact order checks
+        assert!(super::pow_eq_one(&omega, n), "omega^N must be 1");
+        assert!(
+            !super::pow_eq_one(&omega, n / 2),
+            "omega must have exact order N (omega^(N/2) != 1)"
+        );
+
+        // Distinctness: enumerate {omega^i} for i in 0..N and ensure all unique.
+        // Use canonical big-endian bytes as HashSet keys.
+        let mut set = HashSet::with_capacity(n);
+        let mut acc = F::one();
+        for _ in 0..n {
+            set.insert(acc.into_bigint().to_bytes_be());
+            acc *= omega;
+        }
+        assert_eq!(set.len(), n, "domain should enumerate N distinct points");
     }
 }
