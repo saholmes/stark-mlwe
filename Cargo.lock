@@ -410,6 +410,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "deep_ali"
+version = "0.1.0"
+dependencies = [
+ "ark-ff",
+ "ark-pallas",
+ "ark-poly",
+ "rand",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

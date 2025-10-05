@@ -1,0 +1,10 @@
+[package]
+name = "deep_ali"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ark-ff = "0.5"
+ark-pallas = "0.5"
+ark-poly = "0.5"
+rand = "0.8"

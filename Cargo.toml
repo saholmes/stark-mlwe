@@ -11,6 +11,7 @@ members = [
     "crates/mle",
     "crates/commitment",
     "crates/channel",
+    "crates/deep_ali",
 ]
 resolver = "2"
 
