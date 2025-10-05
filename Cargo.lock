@@ -50,7 +50,7 @@ dependencies = [
  "ark-ec",
  "ark-ff",
  "ark-serialize",
- "ark-std 0.5.0",
+ "ark-std",
 ]
 
 [[package]]
@@ -63,7 +63,7 @@ dependencies = [
  "ark-ff",
  "ark-poly",
  "ark-serialize",
- "ark-std 0.5.0",
+ "ark-std",
  "educe",
  "fnv",
  "hashbrown",
@@ -83,7 +83,7 @@ dependencies = [
  "ark-ff-asm",
  "ark-ff-macros",
  "ark-serialize",
- "ark-std 0.5.0",
+ "ark-std",
  "arrayvec",
  "digest",
  "educe",
@@ -126,7 +126,7 @@ dependencies = [
  "ahash",
  "ark-ff",
  "ark-serialize",
- "ark-std 0.5.0",
+ "ark-std",
  "educe",
  "fnv",
  "hashbrown",
@@ -139,7 +139,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f4d068aaf107ebcd7dfb52bc748f8030e0fc930ac8e360146ca54c1203088f7"
 dependencies = [
  "ark-serialize-derive",
- "ark-std 0.5.0",
+ "ark-std",
  "arrayvec",
  "digest",
  "num-bigint",
@@ -154,16 +154,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "ark-std"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94893f1e0c6eeab764ade8dc4c0db24caf4fe7cbbaafc0eba0a9030f447b5185"
-dependencies = [
- "num-traits",
- "rand",
 ]
 
 [[package]]
@@ -304,11 +294,10 @@ name = "commitment"
 version = "0.1.0"
 dependencies = [
  "ark-ff",
- "ark-std 0.4.0",
  "field",
  "merkle",
  "poseidon",
- "serde",
+ "rand",
 ]
 
 [[package]]

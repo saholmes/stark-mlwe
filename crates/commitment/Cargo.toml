@@ -9,11 +9,6 @@ ark-ff = { workspace = true }
 field = { path = "../field" }
 merkle = { path = "../merkle" }
 poseidon = { path = "../poseidon" }
-serde = { workspace = true, optional = true, features = ["derive"] }
 
 [dev-dependencies]
-ark-std = { version = "0.4", default-features = false, features = ["std"] }
-
-[features]
-default = []
-serde = ["dep:serde"]
+rand = "0.8"

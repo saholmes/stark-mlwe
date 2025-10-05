@@ -40,12 +40,11 @@ impl MerkleConfig {
 
 /// Deterministic default Poseidon params consistent with your merkle crate.
 pub fn default_params() -> PoseidonParams {
-    // Matches merkle::default_params() seed
     let seed = b"POSEIDON-T17-X5-SEED";
     generate_params_t17_x5(seed)
 }
 
-// Import merkle types exactly as provided.
+// Import merkle types.
 pub use merkle::{default_params as merkle_default_params, MerkleProof, MerkleTree};
 
 /// The commitment digest type is a field element F (root()).
@@ -79,24 +78,25 @@ impl CommitmentScheme for MerkleCommitment {
         (root, MerkleAux { tree })
     }
 
-    fn open(&self, _indices: &[usize], _aux: &Self::Aux) -> Self::Proof {
-        // TODO: Wire to your Merkle proof construction method when available.
-        // For example, if you add:
-        //   impl MerkleTree { pub fn open_many(&self, indices: &[usize]) -> MerkleProof { ... } }
-        // then replace this with: aux.tree.open_many(indices)
-        unimplemented!("MerkleTree::open_many is not implemented in the merkle crate yet")
+    fn open(&self, indices: &[usize], aux: &Self::Aux) -> Self::Proof {
+        aux.tree.open_many(indices)
     }
 
     fn verify(
         &self,
-        _root: &Self::Digest,
-        _indices: &[usize],
-        _values: &[F],
-        _proof: &Self::Proof,
+        root: &Self::Digest,
+        indices: &[usize],
+        values: &[F],
+        proof: &Self::Proof,
     ) -> bool {
-        // TODO: Wire to your Merkle verification when available.
-        // e.g., merkle::verify_many(root, indices, values, proof, self.cfg.ds_tag, self.cfg.params.clone())
-        unimplemented!("merkle::verify_many is not implemented in the merkle crate yet")
+        merkle::verify_many(
+            root,
+            indices,
+            values,
+            proof,
+            self.cfg.ds_tag,
+            self.cfg.params.clone(),
+        )
     }
 }
 
@@ -104,21 +104,25 @@ impl CommitmentScheme for MerkleCommitment {
 mod tests {
     use super::*;
     use ark_ff::UniformRand;
+    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
-    fn merkle_commit_builds_root() {
-        let mut rng = ark_std::test_rng();
-        let n = 16usize;
+    fn merkle_commit_open_verify_roundtrip() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // Choose a non-power-of-arity size to exercise partial groups
+        let n = 37usize;
         let leaves: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
 
         let cfg = MerkleConfig::with_default_params(F::from(123u64));
-        let scheme = MerkleCommitment::new(cfg);
+        let scheme = MerkleCommitment::new(cfg.clone());
         let (root, aux) = scheme.commit(&leaves);
 
-        // Root matches the tree’s root.
-        assert_eq!(root, aux.tree.root());
+        let query_indices = vec![0usize, 5, 7, 16, 36];
+        let proof = scheme.open(&query_indices, &aux);
 
-        // Opening is not implemented yet; ensure the adapter compiles and basic commit works.
-        // Once you add open/verify in the merkle crate, we will enable the full round-trip test.
+        // Select the corresponding values in the same order as query_indices
+        let query_values: Vec<F> = query_indices.iter().map(|&i| leaves[i]).collect();
+
+        assert!(scheme.verify(&root, &query_indices, &query_values, &proof));
     }
 }
