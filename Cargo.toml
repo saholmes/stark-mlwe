@@ -27,3 +27,4 @@ blake3 = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 criterion = "0.5"
+ark-pallas = "0.5"

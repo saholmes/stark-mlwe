@@ -1,6 +1,6 @@
 //! Commitment abstraction with a Merkle implementation matched to your merkle crate.
 
-use field::F;
+use ark_pallas::Fr as F;
 use poseidon::{params::generate_params_t17_x5, PoseidonParams};
 
 /// Trait for vector commitments over field elements.

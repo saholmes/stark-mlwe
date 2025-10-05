@@ -9,3 +9,4 @@ ark-ff = { workspace = true }
 ark-bls12-381 = { workspace = true }
 utils = { path = "../utils" }
 field = { path = "../field" }
+ark-pallas = "0.5"

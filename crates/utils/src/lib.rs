@@ -1,6 +1,6 @@
 use ark_ff::PrimeField;
 use blake3::Hasher;
-use field::F;
+use ark_pallas::Fr as F;
 use serde::{Deserialize, Serialize};
 
 /// Map arbitrary bytes to a field element by reducing mod p (little-endian).

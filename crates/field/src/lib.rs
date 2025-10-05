@@ -5,7 +5,7 @@
 //! - Optional serde derives for your own types via the "serde1" feature.
 //! - Prefer ark_serialize for canonical binary I/O of field elements.
 
-use ark_bls12_381::Fr;
+pub use ark_pallas::Fr as F;
 use ark_ff::{Field, FftField, One, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 
@@ -13,7 +13,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate
 use serde::{Deserialize, Serialize};
 
 /// Re-export the field type so users can depend on this crate for the field alias.
-pub type F = Fr;
+/// pub type F = Fr;
 
 /// A simple multiplicative subgroup domain of size n = 2^log_n.
 /// Stores the generator (omega) and optionally precomputes the elements.

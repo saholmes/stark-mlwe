@@ -1,5 +1,5 @@
 use ark_ff::Zero;
-use field::F;
+use ark_pallas::Fr as F;
 
 /// Multilinear polynomial represented by its evaluations on the {0,1}^n hypercube,
 /// stored in lexicographic order of indices 0..2^n.

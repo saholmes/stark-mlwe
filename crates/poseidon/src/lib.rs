@@ -1,5 +1,5 @@
 use ark_ff::{Field, Zero};
-use field::F;
+use ark_pallas::Fr as F;
 use utils::fr_from_hash;
 
 // Poseidon permutation parameters for benchmarking and M1 scaffolding.

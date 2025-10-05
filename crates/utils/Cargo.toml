@@ -10,3 +10,4 @@ ark-bls12-381 = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 field = { path = "../field" }
+ark-pallas = "0.5"

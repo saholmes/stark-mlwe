@@ -8,6 +8,7 @@ license = "Apache-2.0"
 ark-ff = { workspace = true }
 ark-serialize = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+ark-pallas = "0.5"
 
 field = { path = "../field" }
 poseidon = { path = "../poseidon" }

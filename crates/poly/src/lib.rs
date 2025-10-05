@@ -1,6 +1,6 @@
 //! poly crate: thin helpers around ark_poly 0.5.x univariate dense polynomials.
 
-use ark_bls12_381::Fr as F;
+use ark_pallas::Fr as F;
 use ark_ff::{One, Zero};
 use ark_poly::{
     univariate::DensePolynomial,

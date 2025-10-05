@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use field::F;
+use ark_pallas::Fr as F;
 use fft::fft_pow2;
 use merkle::build_mary;
 use poseidon::{params::generate_params_t17_x5, permute, T};

@@ -11,6 +11,7 @@ commitment = { path = "../commitment" }
 serde = { version = "1", features = ["derive"] }
 poseidon = { path = "../poseidon" } # for params in tests or builders
 transcript = { path = "../transcript" } # adjust if your transcript lives elsewhere
+ark-pallas = "0.5"
 
 [dev-dependencies]
 rand = "0.8"

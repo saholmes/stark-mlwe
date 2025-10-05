@@ -1,5 +1,5 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
-use field::F;
+use ark_pallas::Fr as F;
 use poseidon::{hash_with_ds, params::generate_params_t17_x5, PoseidonParams};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

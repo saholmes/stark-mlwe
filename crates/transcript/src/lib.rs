@@ -1,5 +1,5 @@
 use ark_ff::{PrimeField, Zero};
-use field::F;
+use ark_pallas::Fr as F;
 use poseidon::{permute, PoseidonParams, RATE, T};
 
 // Domain separation tags for transcript operations.

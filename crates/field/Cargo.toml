@@ -22,5 +22,7 @@ serde = { workspace = true, optional = true, features = ["derive"] }
 # Utilities
 rand = { workspace = true }
 
+ark-pallas = "0.5"
+
 [dev-dependencies]
 criterion = { workspace = true }

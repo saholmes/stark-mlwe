@@ -1,4 +1,4 @@
-use field::F;
+use ark_pallas::Fr as F;
 
 use ark_ff::BigInteger;
 use commitment::{CommitmentScheme, MerkleCommitment, MerkleConfig, MerkleProof, MerkleRoot};
