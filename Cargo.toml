@@ -9,6 +9,7 @@ members = [
     "crates/bench",
     "crates/transcript",
     "crates/mle",
+    "crates/commitment",
 ]
 resolver = "2"
 
