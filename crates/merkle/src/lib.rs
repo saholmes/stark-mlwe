@@ -333,6 +333,120 @@ pub fn default_params() -> PoseidonParams {
     generate_params_t17_x5(seed)
 }
 
+// ========== Milestone 2: Combined-leaf hashing (pack (f, cp) into a single absorb) ==========
+
+fn encode_leaf_digest_legacy(f: F, cp: F, ds_tag: F, params: &PoseidonParams) -> F {
+    // One hash call absorbing [f, cp], returning one digest element.
+    hash_with_ds(&[f, cp], ds_tag, params)
+}
+
+// For DS-aware encoding, we dedicate a special level marker for leaves to avoid ambiguity with internal node levels.
+const LEAF_LEVEL_DS: u32 = u32::MAX;
+
+fn encode_leaf_digest_ds(index: usize, cfg: &MerkleChannelCfg, f: F, cp: F) -> F {
+    let ds = DsLabel {
+        arity: cfg.arity,
+        level: LEAF_LEVEL_DS,
+        position: index as u64,
+        tree_label: cfg.tree_label,
+    };
+    hash_with_ds_dynamic(&ds.to_fields(), &[f, cp], &cfg.params)
+}
+
+impl MerkleTree {
+    // Build a Merkle tree from pairs (f, cp) using DS-aware leaf encoding and internal DS-aware nodes.
+    pub fn new_pairs(f_vals: &[F], cp_vals: &[F], cfg: MerkleChannelCfg) -> Self {
+        assert_eq!(f_vals.len(), cp_vals.len(), "f and cp length mismatch");
+        assert!(!f_vals.is_empty(), "no leaves");
+        let n = f_vals.len();
+
+        // Compute leaf digests from pairs with DS-aware leaf DS.
+        let mut level0: Vec<F> = Vec::with_capacity(n);
+        for i in 0..n {
+            level0.push(encode_leaf_digest_ds(i, &cfg, f_vals[i], cp_vals[i]));
+        }
+
+        // Reuse DS-aware internal-node building from new(), but starting from precomputed level 0.
+        let arity = cfg.arity;
+        let mut levels: Vec<Vec<F>> = Vec::new();
+        levels.push(level0);
+
+        let t = cfg.params.t;
+        assert_eq!(t, arity + 1, "poseidon width t must equal arity + 1");
+
+        let mut cur_level = 0u32; // 0 = parents of leaves
+        while levels.last().unwrap().len() > 1 {
+            let cur = levels.last().unwrap();
+            let mut next = Vec::with_capacity((cur.len() + arity - 1) / arity);
+            for (parent_idx, chunk) in cur.chunks(arity).enumerate() {
+                let ds = DsLabel {
+                    arity,
+                    level: cur_level,
+                    position: parent_idx as u64,
+                    tree_label: cfg.tree_label,
+                };
+                let digest = hash_with_ds_dynamic(&ds.to_fields(), chunk, &cfg.params);
+                next.push(digest);
+            }
+            levels.push(next);
+            cur_level += 1;
+        }
+        let root = *levels.last().unwrap().first().unwrap();
+
+        MerkleTree {
+            leaves: levels[0].iter().copied().map(SerFr::from).collect(),
+            root: SerFr(root),
+            ds_tag: SerFr(F::from(0u64)), // unused in DS path
+            levels: levels
+                .into_iter()
+                .map(|v| v.into_iter().map(SerFr::from).collect())
+                .collect(),
+            params: default_params(), // legacy fixed params unused here
+            cfg: Some(cfg),
+        }
+    }
+
+    // Legacy combined-leaf constructor: fixed t=17, leaf digest = Poseidon([f,cp]) with ds_tag in capacity.
+    pub fn new_pairs_legacy(f_vals: &[F], cp_vals: &[F], ds_tag: F, params: PoseidonParams) -> Self {
+        assert_eq!(f_vals.len(), cp_vals.len(), "f and cp length mismatch");
+        assert!(!f_vals.is_empty(), "no leaves");
+        let n = f_vals.len();
+
+        // Compute leaf digests from pairs in legacy mode.
+        let mut level0: Vec<F> = Vec::with_capacity(n);
+        for i in 0..n {
+            let d = encode_leaf_digest_legacy(f_vals[i], cp_vals[i], ds_tag, &params);
+            level0.push(d);
+        }
+
+        // Build internal nodes exactly as legacy new_legacy would (group by RATE=16).
+        let mut levels: Vec<Vec<F>> = Vec::new();
+        levels.push(level0);
+        while levels.last().unwrap().len() > 1 {
+            let cur = levels.last().unwrap();
+            let mut next = Vec::with_capacity((cur.len() + poseidon::RATE - 1) / poseidon::RATE);
+            for chunk in cur.chunks(poseidon::RATE) {
+                let digest = hash_with_ds(chunk, ds_tag, &params);
+                next.push(digest);
+            }
+            levels.push(next);
+        }
+        let root = *levels.last().unwrap().first().unwrap();
+
+        MerkleTree {
+            leaves: levels[0].iter().copied().map(SerFr::from).collect(),
+            root: SerFr(root),
+            ds_tag: SerFr(ds_tag),
+            levels: levels
+                .into_iter()
+                .map(|v| v.into_iter().map(SerFr::from).collect())
+                .collect(),
+            params,
+            cfg: None,
+        }
+    }
+}
+
 pub fn verify_many(
     root: &F,
     indices: &[usize],
@@ -520,6 +634,158 @@ pub fn verify_many_ds(
         return false;
     }
     cur_values[0] == *root
+}
+
+// Verify pairs under legacy mode: recompute leaf digests from (f,cp) pairs and then verify path.
+pub fn verify_pairs_legacy(
+    root: &F,
+    indices: &[usize],
+    pairs: &[(F, F)],
+    proof: &MerkleProof,
+    ds_tag: F,
+    params: PoseidonParams,
+) -> bool {
+    if indices.len() != pairs.len() || indices.is_empty() {
+        return false;
+    }
+    // Compute leaf digests in the same order as indices.
+    let leaves: Vec<F> = pairs
+        .iter()
+        .map(|&(f, cp)| encode_leaf_digest_legacy(f, cp, ds_tag, &params))
+        .collect();
+    verify_many(root, indices, &leaves, proof, ds_tag, params)
+}
+
+// Verify pairs under DS-aware mode: recompute leaf digests with leaf DS and then verify with DS-aware internal hashing.
+pub fn verify_pairs_ds(
+    root: &F,
+    indices: &[usize],
+    pairs: &[(F, F)],
+    proof: &MerkleProof,
+    tree_label: u64,
+    dyn_params: PoseidonParamsDynamic,
+) -> bool {
+    if indices.len() != pairs.len() || indices.is_empty() {
+        return false;
+    }
+    let arity = proof.arity;
+    if dyn_params.t != arity + 1 {
+        return false;
+    }
+    // Recompute leaf digests using the agreed DS policy (LEAF_LEVEL_DS).
+    let leaves: Vec<F> = indices
+        .iter()
+        .zip(pairs.iter())
+        .map(|(&idx, &(f, cp))| {
+            let ds = DsLabel {
+                arity,
+                level: LEAF_LEVEL_DS,
+                position: idx as u64,
+                tree_label,
+            };
+            hash_with_ds_dynamic(&ds.to_fields(), &[f, cp], &dyn_params)
+        })
+        .collect();
+
+    verify_many_ds(root, indices, &leaves, proof, tree_label, dyn_params)
+}
+
+// ========== Small facades for ergonomics ==========
+
+pub struct MerkleProver {
+    pub cfg: MerkleChannelCfg,
+}
+
+impl MerkleProver {
+    pub fn new(cfg: MerkleChannelCfg) -> Self {
+        Self { cfg }
+    }
+
+    // Commit a vector of pairs (f, cp) as combined leaves; returns root and the constructed tree.
+    pub fn commit_pairs(&self, f_vals: &[F], cp_vals: &[F]) -> (F, MerkleTree) {
+        let tree = MerkleTree::new_pairs(f_vals, cp_vals, self.cfg.clone());
+        (tree.root(), tree)
+    }
+
+    // Open a set of indices; returns the original pairs at those indices and the Merkle proof.
+    // Note: this function assumes the caller provides the original arrays to extract pairs.
+    pub fn open_pairs(
+        &self,
+        tree: &MerkleTree,
+        f_vals: &[F],
+        cp_vals: &[F],
+        indices: &[usize],
+    ) -> (Vec<(F, F)>, MerkleProof) {
+        assert_eq!(f_vals.len(), cp_vals.len(), "length mismatch");
+        assert!(!indices.is_empty(), "empty indices");
+        let pairs: Vec<(F, F)> = indices.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+        let proof = tree.open_many(indices);
+        (pairs, proof)
+    }
+
+    pub fn verify_pairs(
+        &self,
+        root: &F,
+        indices: &[usize],
+        pairs: &[(F, F)],
+        proof: &MerkleProof,
+    ) -> bool {
+        verify_pairs_ds(
+            root,
+            indices,
+            pairs,
+            proof,
+            self.cfg.tree_label,
+            self.cfg.params.clone(),
+        )
+    }
+}
+
+pub struct LegacyMerkleProver {
+    pub ds_tag: F,
+    pub params: PoseidonParams,
+}
+
+impl LegacyMerkleProver {
+    pub fn new(ds_tag: F, params: PoseidonParams) -> Self {
+        Self { ds_tag, params }
+    }
+
+    pub fn commit_pairs(&self, f_vals: &[F], cp_vals: &[F]) -> (F, MerkleTree) {
+        let tree = MerkleTree::new_pairs_legacy(f_vals, cp_vals, self.ds_tag, self.params.clone());
+        (tree.root(), tree)
+    }
+
+    pub fn open_pairs(
+        &self,
+        tree: &MerkleTree,
+        f_vals: &[F],
+        cp_vals: &[F],
+        indices: &[usize],
+    ) -> (Vec<(F, F)>, MerkleProof) {
+        assert_eq!(f_vals.len(), cp_vals.len(), "length mismatch");
+        assert!(!indices.is_empty(), "empty indices");
+        let pairs: Vec<(F, F)> = indices.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+        let proof = tree.open_many(indices);
+        (pairs, proof)
+    }
+
+    pub fn verify_pairs(
+        &self,
+        root: &F,
+        indices: &[usize],
+        pairs: &[(F, F)],
+        proof: &MerkleProof,
+    ) -> bool {
+        verify_pairs_legacy(
+            root,
+            indices,
+            pairs,
+            proof,
+            self.ds_tag,
+            self.params.clone(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -790,5 +1056,114 @@ mod tests {
         }
         let d5 = hash_with_ds_dynamic(&ds.to_fields(), &shuffled, &cfg.params);
         assert_ne!(parent_digest, d5, "shuffling children must change digest");
+    }
+
+    // ========== Milestone 2 tests: combined-leaf (f, cp) encoded in one absorb ==========
+
+    #[test]
+    fn test_combined_leaf_commit_open_legacy() {
+        // Legacy combined leaves: build, open, verify.
+        let mut rng = StdRng::seed_from_u64(2024);
+        let n = 37usize;
+        let f_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+        let cp_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+
+        let params = default_params();
+        let ds_tag = F::from(99u64);
+        let tree = MerkleTree::new_pairs_legacy(&f_vals, &cp_vals, ds_tag, params.clone());
+        let root = tree.root();
+
+        // Select some indices
+        let idx = vec![0usize, 1, 5, 19, 36];
+        let pairs: Vec<(F, F)> = idx.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+
+        let proof = tree.open_many(&idx);
+        assert!(verify_pairs_legacy(&root, &idx, &pairs, &proof, ds_tag, params));
+    }
+
+    #[test]
+    fn test_combined_leaf_commit_open_ds_arity16() {
+        // DS-aware combined leaves: arity=16
+        let mut rng = StdRng::seed_from_u64(2025);
+        let n = 64usize;
+        let f_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+        let cp_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+
+        let cfg = MerkleChannelCfg::new(16).with_tree_label(777);
+        let tree = MerkleTree::new_pairs(&f_vals, &cp_vals, cfg.clone());
+        let root = tree.root();
+
+        let idx = vec![0usize, 7, 16, 31, 63];
+        let pairs: Vec<(F, F)> = idx.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+        let proof = tree.open_many(&idx);
+
+        let dyn_params = poseidon_params_for_width(16 + 1);
+        assert!(verify_pairs_ds(
+            &root,
+            &idx,
+            &pairs,
+            &proof,
+            cfg.tree_label,
+            dyn_params
+        ));
+
+        // Negative sanity: alter cp of one pair -> verification fails
+        let mut tampered = pairs.clone();
+        tampered[0].1 += F::from(1u64);
+        assert!(!verify_pairs_ds(
+            &root,
+            &idx,
+            &tampered,
+            &proof,
+            cfg.tree_label,
+            poseidon_params_for_width(17)
+        ));
+    }
+
+    #[test]
+    fn test_combined_leaf_commit_open_ds_arity8() {
+        // DS-aware combined leaves: arity=8 (t=9)
+        let mut rng = StdRng::seed_from_u64(3030);
+        let n = 32usize;
+        let f_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+        let cp_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
+
+        let cfg = MerkleChannelCfg::new(8).with_tree_label(8888);
+        let tree = MerkleTree::new_pairs(&f_vals, &cp_vals, cfg.clone());
+        let root = tree.root();
+
+        let idx = vec![0usize, 3, 7, 8, 15, 23, 31];
+        let pairs: Vec<(F, F)> = idx.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+        let proof = tree.open_many(&idx);
+
+        let dyn_params = poseidon_params_for_width(8 + 1);
+        assert!(verify_pairs_ds(
+            &root,
+            &idx,
+            &pairs,
+            &proof,
+            cfg.tree_label,
+            dyn_params
+        ));
+
+        // Tamper one f value should fail
+        let mut tampered = pairs.clone();
+        tampered[2].0 += F::from(1u64);
+        assert!(!verify_pairs_ds(
+            &root,
+            &idx,
+            &tampered,
+            &proof,
+            cfg.tree_label,
+            poseidon_params_for_width(9)
+        ));
+
+        // Prover facade smoke test
+        let prover = MerkleProver::new(cfg.clone());
+        let (root2, tree2) = prover.commit_pairs(&f_vals, &cp_vals);
+        assert_eq!(root, root2);
+        let (pairs2, proof2) = prover.open_pairs(&tree2, &f_vals, &cp_vals, &idx);
+        assert_eq!(pairs, pairs2);
+        assert!(prover.verify_pairs(&root2, &idx, &pairs2, &proof2));
     }
 }
