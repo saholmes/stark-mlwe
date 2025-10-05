@@ -533,6 +533,8 @@ dependencies = [
  "ark-ff 0.4.2",
  "ark-pallas 0.4.0",
  "ark-poly 0.4.2",
+ "ark-serialize 0.4.2",
+ "blake3",
  "rand",
 ]
 

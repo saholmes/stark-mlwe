@@ -3,40 +3,21 @@ name = "deep_ali"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
-description = "DEEP-ALI utilities with barycentric evaluation, optional blinding, and a cached radix-2 domain facade"
+description = "DEEP-ALI and FRI scaffolding"
 repository = "https://example.com/your/repo"
-keywords = ["zkp", "stark", "fri", "polynomials"]
-categories = ["cryptography", "science"]
 
 [dependencies]
 ark-ff = "0.4"
 ark-poly = "0.4"
 ark-pallas = "0.4"
+ark-serialize = "0.4"
 rand = { version = "0.8", features = ["std", "std_rng"] }
+blake3 = "1.5"
 
 [dev-dependencies]
-# Same as dependencies; separated in case you want benches or proptest later.
 ark-ff = "0.4"
 ark-poly = "0.4"
 ark-pallas = "0.4"
+ark-serialize = "0.4"
 rand = { version = "0.8", features = ["std", "std_rng"] }
-
-[lib]
-name = "deep_ali"
-path = "src/lib.rs"
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
-[profile.dev]
-opt-level = 1
-
-[profile.test]
-opt-level = 1
-debug = true
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
+blake3 = "1.5"
