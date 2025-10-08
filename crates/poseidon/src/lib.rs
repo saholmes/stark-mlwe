@@ -332,3 +332,101 @@ pub mod params {
         PoseidonParams { mds, rc_full, rc_partial }
     }
 }
+
+// ======================= NEW: Static <-> Dynamic adapters =======================
+
+impl From<&PoseidonParams> for PoseidonParamsDynamic {
+    fn from(p: &PoseidonParams) -> Self {
+        let t = T;
+        let rate = RATE;
+        let rf = RF;
+        let rp = RP;
+
+        // MDS to Vec<Vec<F>>
+        let mut mds_v = vec![vec![F::zero(); t]; t];
+        for i in 0..t {
+            for j in 0..t {
+                mds_v[i][j] = p.mds[i][j];
+            }
+        }
+
+        // rc_full RF x t
+        let mut rc_full_v = vec![vec![F::zero(); t]; rf];
+        for r in 0..rf {
+            for i in 0..t {
+                rc_full_v[r][i] = p.rc_full[r][i];
+            }
+        }
+
+        // rc_partial RP
+        let mut rc_partial_v = vec![F::zero(); rp];
+        for r in 0..rp {
+            rc_partial_v[r] = p.rc_partial[r];
+        }
+
+        PoseidonParamsDynamic {
+            t,
+            rate,
+            rounds_full: rf,
+            rounds_partial: rp,
+            alpha: ALPHA,
+            mds: mds_v,
+            rc_full: rc_full_v,
+            rc_partial: rc_partial_v,
+        }
+    }
+}
+
+/// Convenience wrapper for t=17 static -> dynamic.
+pub fn dynamic_from_static_t17(p: &PoseidonParams) -> PoseidonParamsDynamic {
+    PoseidonParamsDynamic::from(p)
+}
+
+/// Optional helper: only valid when params describe t=17.
+pub fn static_from_dynamic_t17(d: &PoseidonParamsDynamic) -> PoseidonParams {
+    assert_eq!(d.t, T, "static_from_dynamic_t17 requires t=17");
+    assert_eq!(d.rounds_full, RF, "rounds_full mismatch");
+    assert_eq!(d.rounds_partial, RP, "rounds_partial mismatch (expected RP={})", RP);
+
+    let mut mds = [[F::zero(); T]; T];
+    for i in 0..T {
+        for j in 0..T {
+            mds[i][j] = d.mds[i][j];
+        }
+    }
+    let mut rc_full = [[F::zero(); T]; RF];
+    for r in 0..RF {
+        for i in 0..T {
+            rc_full[r][i] = d.rc_full[r][i];
+        }
+    }
+    let mut rc_partial = [F::zero(); RP];
+    for r in 0..RP {
+        rc_partial[r] = d.rc_partial[r];
+    }
+    PoseidonParams { mds, rc_full, rc_partial }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::params::generate_params_t17_x5;
+
+    #[test]
+    fn static_dynamic_roundtrip_t17() {
+        let seed = b"POSEIDON-T17-X5-SEED";
+        let p_static = generate_params_t17_x5(seed);
+        let d = PoseidonParamsDynamic::from(&p_static);
+        assert_eq!(d.t, T);
+        assert_eq!(d.rate, RATE);
+        assert_eq!(d.rounds_full, RF);
+        assert_eq!(d.rounds_partial, RP);
+        assert_eq!(d.alpha, ALPHA);
+
+        let p_back = static_from_dynamic_t17(&d);
+        // Compare a few entries to ensure mapping is correct
+        assert_eq!(p_back.mds[0][0], p_static.mds[0][0]);
+        assert_eq!(p_back.rc_full[0][0], p_static.rc_full[0][0]);
+        assert_eq!(p_back.rc_partial[0], p_static.rc_partial[0]);
+    }
+}

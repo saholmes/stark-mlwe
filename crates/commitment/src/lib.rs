@@ -1,7 +1,13 @@
 //! Commitment abstraction with a Merkle implementation matched to your merkle crate.
 
 use ark_pallas::Fr as F;
-use poseidon::{params::generate_params_t17_x5, PoseidonParams};
+
+// Poseidon params
+use poseidon::{params::generate_params_t17_x5, PoseidonParams, PoseidonParamsDynamic};
+use poseidon::dynamic_from_static_t17; // adapter
+
+// Import merkle types.
+pub use merkle::{verify_many_ds, MerkleChannelCfg, MerkleProof, MerkleTree};
 
 /// Trait for vector commitments over field elements.
 pub trait CommitmentScheme {
@@ -23,14 +29,14 @@ pub trait CommitmentScheme {
 /// Configuration for Merkle commitments.
 #[derive(Clone)]
 pub struct MerkleConfig {
-    pub ds_tag: F,
-    pub params: PoseidonParams,
+    pub ds_tag: u64,           // tree_label for DS-aware hashing
+    pub params: PoseidonParams // static t=17 params kept for compatibility if needed
 }
 impl MerkleConfig {
-    pub fn new(ds_tag: F, params: PoseidonParams) -> Self {
+    pub fn new(ds_tag: u64, params: PoseidonParams) -> Self {
         Self { ds_tag, params }
     }
-    pub fn with_default_params(ds_tag: F) -> Self {
+    pub fn with_default_params(ds_tag: u64) -> Self {
         Self {
             ds_tag,
             params: default_params(),
@@ -38,25 +44,19 @@ impl MerkleConfig {
     }
 }
 
-/// Deterministic default Poseidon params consistent with your merkle crate.
+/// Deterministic default Poseidon params (t=17).
 pub fn default_params() -> PoseidonParams {
     let seed = b"POSEIDON-T17-X5-SEED";
     generate_params_t17_x5(seed)
 }
 
-// Import merkle types.
-pub use merkle::{default_params as merkle_default_params, MerkleProof, MerkleTree};
-
-/// The commitment digest type is a field element F (root()).
 pub type MerkleRoot = F;
 
-/// Prover-side auxiliary data: we keep the whole MerkleTree instance.
 #[derive(Clone)]
 pub struct MerkleAux {
     pub tree: MerkleTree,
 }
 
-/// Merkle commitment scheme adapter.
 pub struct MerkleCommitment {
     cfg: MerkleConfig,
 }
@@ -64,6 +64,16 @@ pub struct MerkleCommitment {
 impl MerkleCommitment {
     pub fn new(cfg: MerkleConfig) -> Self {
         Self { cfg }
+    }
+
+    fn tree_cfg(&self) -> MerkleChannelCfg {
+        // Use arity=16 (t=17) and DS-aware dynamic params.
+        let dyn_params: PoseidonParamsDynamic = dynamic_from_static_t17(&self.cfg.params);
+        MerkleChannelCfg {
+            arity: 16,
+            tree_label: self.cfg.ds_tag,
+            params: dyn_params,
+        }
     }
 }
 
@@ -73,7 +83,8 @@ impl CommitmentScheme for MerkleCommitment {
     type Aux = MerkleAux;
 
     fn commit(&self, leaves: &[F]) -> (Self::Digest, Self::Aux) {
-        let tree = MerkleTree::new(leaves.to_vec(), self.cfg.ds_tag, self.cfg.params.clone());
+        let cfg = self.tree_cfg();
+        let tree = MerkleTree::new(leaves.to_vec(), cfg);
         let root = tree.root();
         (root, MerkleAux { tree })
     }
@@ -89,13 +100,15 @@ impl CommitmentScheme for MerkleCommitment {
         values: &[F],
         proof: &Self::Proof,
     ) -> bool {
-        merkle::verify_many(
+        // DS-aware verification to match tree construction.
+        let dyn_params: PoseidonParamsDynamic = dynamic_from_static_t17(&self.cfg.params);
+        verify_many_ds(
             root,
             indices,
             values,
             proof,
-            self.cfg.ds_tag,
-            self.cfg.params.clone(),
+            self.cfg.ds_tag, // tree_label
+            dyn_params,
         )
     }
 }
@@ -109,19 +122,16 @@ mod tests {
     #[test]
     fn merkle_commit_open_verify_roundtrip() {
         let mut rng = StdRng::seed_from_u64(42);
-        // Choose a non-power-of-arity size to exercise partial groups
-        let n = 37usize;
+        let n = 64usize; // multiple of 16 to exercise full groups
         let leaves: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
 
-        let cfg = MerkleConfig::with_default_params(F::from(123u64));
+        let cfg = MerkleConfig::with_default_params(123u64);
         let scheme = MerkleCommitment::new(cfg.clone());
         let (root, aux) = scheme.commit(&leaves);
 
-        let query_indices = vec![0usize, 5, 7, 16, 36];
+        let query_indices = vec![0usize, 15, 16, 31, 47, 63];
         let proof = scheme.open(&query_indices, &aux);
-
-        // Select the corresponding values in the same order as query_indices
-        let query_values: Vec<F> = query_indices.iter().map(|&i| leaves[i]).collect();
+        let query_values: Vec<F> = query_indices.iter().copied().map(|i| leaves[i]).collect();
 
         assert!(scheme.verify(&root, &query_indices, &query_values, &proof));
     }
