@@ -1,6 +1,6 @@
 use ark_pallas::Fr as F;
 
-use ark_ff::BigInteger;
+use ark_ff::{BigInteger, PrimeField};
 use commitment::{CommitmentScheme, MerkleCommitment, MerkleConfig, MerkleProof, MerkleRoot};
 use transcript::Transcript;
 
@@ -116,19 +116,29 @@ impl VerifierChannel {
     }
 }
 
+// Helper: map an Fr tag to a u64 tree_label deterministically (low 64 bits).
+fn fr_tag_to_u64(tag: F) -> u64 {
+    let bi = tag.into_bigint();
+    // ark_ff BigInteger exposes limbs via internal array; low limb is index 0 (little-endian).
+    bi.0[0] as u64
+}
+
 #[derive(Clone)]
 pub struct MerkleChannelCfg {
     pub cfg: MerkleConfig,
 }
 impl MerkleChannelCfg {
+    // Accept Fr for compatibility and convert to u64 tree_label for DS-aware Merkle.
     pub fn new(ds_tag: F, params: poseidon::PoseidonParams) -> Self {
+        let tree_label = fr_tag_to_u64(ds_tag);
         Self {
-            cfg: MerkleConfig::new(ds_tag, params),
+            cfg: MerkleConfig::new(tree_label, params),
         }
     }
     pub fn with_default_params(ds_tag: F) -> Self {
+        let tree_label = fr_tag_to_u64(ds_tag);
         Self {
-            cfg: MerkleConfig::with_default_params(ds_tag),
+            cfg: MerkleConfig::with_default_params(tree_label),
         }
     }
     fn scheme(&self) -> MerkleCommitment {
@@ -212,8 +222,9 @@ impl<'a> MerkleVerifier<'a> {
         proof: &MerkleProof,
     ) -> bool {
         self.chan.recv_opening(indices, values, proof);
-        let root = self.root.expect("root not set; call receive_root");
-        self.cfg.scheme().verify(&root, indices, values, proof)
+        self.root
+            .map(|root| self.cfg.scheme().verify(&root, indices, values, proof))
+            .unwrap_or(false)
     }
 
     pub fn challenge_scalar(&mut self, label: &[u8]) -> F {
