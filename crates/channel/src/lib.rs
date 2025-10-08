@@ -878,6 +878,367 @@ impl<'a> SumCheckMFVerifier<'a> {
     }
 }
 
+// =========================
+// End-to-end NIZK interface
+// =========================
+
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use serde::{Deserialize, Serialize};
+use serde_bytes;
+use merkle::SerFr;
+
+// Bring the proof and SerFr types into scope from your merkle crate
+
+
+// A serde-friendly wrapper for field elements as bytes
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FBytes(#[serde(with = "serde_bytes")] pub Vec<u8>);
+
+impl From<F> for FBytes {
+    fn from(f: F) -> Self {
+        let mut v = Vec::with_capacity(32);
+        f.serialize_compressed(&mut v).expect("serialize Fr");
+        FBytes(v)
+    }
+}
+impl From<&F> for FBytes {
+    fn from(f: &F) -> Self {
+        let mut v = Vec::with_capacity(32);
+        f.serialize_compressed(&mut v).expect("serialize Fr");
+        FBytes(v)
+    }
+}
+impl TryFrom<&FBytes> for F {
+    type Error = ark_serialize::SerializationError;
+    fn try_from(b: &FBytes) -> Result<Self, Self::Error> {
+        F::deserialize_compressed(b.0.as_slice())
+    }
+}
+impl TryFrom<FBytes> for F {
+    type Error = ark_serialize::SerializationError;
+    fn try_from(b: FBytes) -> Result<Self, Self::Error> {
+        F::deserialize_compressed(b.0.as_slice())
+    }
+}
+
+// Minimal VK (avoid serializing params; derive them at runtime)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VK {
+    pub poseidon_seed: String, // "default"
+    pub tree_label: u64,
+    pub k: usize,
+    pub variant: VKVariant,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub enum VKVariant {
+    SumCheckPlain,
+    SumCheckMF { queries_per_round: usize },
+}
+
+// Proofs (serde-friendly)
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProofPlain {
+    pub root: FBytes,
+    pub rounds: Vec<(FBytes, FBytes)>, // (c0, c1) per round
+    pub extra_openings: Option<(Vec<usize>, Vec<FBytes>, MerkleProofBytes)>, // optional; unused here
+    pub final_eval: FBytes,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProofMF {
+    pub initial_root: FBytes,
+    pub rounds: Vec<RoundMF>,
+    pub final_eval: FBytes,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RoundMF {
+    pub c0: FBytes,
+    pub c1: FBytes,
+    pub next_root: FBytes,
+    pub cur_indices: Vec<usize>,
+    pub cur_values: Vec<FBytes>,
+    pub cur_proof: MerkleProofBytes,
+    pub next_indices: Vec<usize>,
+    pub next_values: Vec<FBytes>,
+    pub next_proof: MerkleProofBytes,
+}
+
+// Mirror of your MerkleProof:
+// - group_sizes: Vec<Vec<u8>>
+// - siblings: Vec<Vec<SerFr>> (we serialize SerFr using its serde impl, but
+//   in this wrapper we keep uniformity and store sibling elements as FBytes via F.)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MerkleProofBytes {
+    pub arity: usize,
+    pub group_sizes: Vec<Vec<u8>>,
+    pub indices: Vec<usize>,
+    pub siblings: Vec<Vec<FBytes>>,
+}
+
+// SerFr <-> FBytes adapters using the SerFr newtype over F
+fn serfr_to_fbytes(sf: &SerFr) -> FBytes {
+    // SerFr(F), and FBytes uses ark-serialize. Convert via F directly.
+    FBytes::from(sf.0)
+}
+fn fbytes_to_serfr(fb: &FBytes) -> SerFr {
+    let f: F = F::try_from(fb).expect("Fr");
+    SerFr(f)
+}
+
+// Convert MerkleProof -> MerkleProofBytes
+fn merkle_proof_to_bytes(p: &MerkleProof) -> MerkleProofBytes {
+    let siblings_bytes: Vec<Vec<FBytes>> = p
+        .siblings
+        .iter()
+        .map(|group| group.iter().map(|sf| serfr_to_fbytes(sf)).collect())
+        .collect();
+
+    MerkleProofBytes {
+        arity: p.arity,
+        group_sizes: p.group_sizes.clone(), // Vec<Vec<u8>>
+        indices: p.indices.clone(),
+        siblings: siblings_bytes,
+    }
+}
+
+// Convert MerkleProofBytes -> MerkleProof
+fn merkle_proof_from_bytes(pb: &MerkleProofBytes) -> MerkleProof {
+    let siblings_ser: Vec<Vec<SerFr>> = pb
+        .siblings
+        .iter()
+        .map(|group| group.iter().map(|fb| fbytes_to_serfr(fb)).collect())
+        .collect();
+
+    MerkleProof {
+        indices: pb.indices.clone(),
+        siblings: siblings_ser,
+        group_sizes: pb.group_sizes.clone(),
+        arity: pb.arity,
+    }
+}
+
+// Public builders
+
+pub fn build_vk_plain(k: usize, ds_tag: F) -> VK {
+    VK {
+        poseidon_seed: "default".to_string(),
+        tree_label: fr_tag_to_u64(ds_tag),
+        k,
+        variant: VKVariant::SumCheckPlain,
+    }
+}
+
+pub fn build_vk_mf(k: usize, ds_tag: F, queries_per_round: usize) -> VK {
+    VK {
+        poseidon_seed: "default".to_string(),
+        tree_label: fr_tag_to_u64(ds_tag),
+        k,
+        variant: VKVariant::SumCheckMF { queries_per_round },
+    }
+}
+
+// PROVE (plain)
+
+pub fn prove_plain(vk: &VK, witness: &[F]) -> ProofPlain {
+    assert!(matches!(vk.variant, VKVariant::SumCheckPlain), "wrong VK variant");
+
+    let p_tr = Transcript::new(b"E2E/PLAIN", transcript::default_params());
+    let mut pchan = ProverChannel::new(p_tr);
+
+    let merkle_cfg = MerkleChannelCfg::with_default_params(F::from(vk.tree_label));
+    let mut mp = MerkleProver::new(&mut pchan, merkle_cfg.clone());
+    let root_f = mp.commit_vector(witness);
+
+    let mle = Mle::new(witness.to_vec());
+    let mut sp = SumCheckProver::new(MleProver::new(mp, mle));
+
+    // Bind the claim the same way as the verifier expects.
+    let s = sp.send_claim();
+
+    let mut rounds = Vec::with_capacity(vk.k);
+    for i in 0..vk.k {
+        // Use the same label family as in your tested e2e_sumcheck_roundtrip
+        let (c0, c1, _r_i) = sp.round(i, b"sumcheck/r");
+        rounds.push((FBytes::from(c0), FBytes::from(c1)));
+    }
+
+    let final_eval_f = sp.finalize_and_bind_eval();
+
+    ProofPlain {
+        root: FBytes::from(root_f),
+        rounds,
+        extra_openings: None,
+        final_eval: FBytes::from(final_eval_f),
+    }
+}
+
+// VERIFY (plain)
+
+pub fn verify_plain(vk: &VK, proof: &ProofPlain) -> bool {
+    assert!(matches!(vk.variant, VKVariant::SumCheckPlain), "wrong VK variant");
+
+    let v_tr = Transcript::new(b"E2E/PLAIN", transcript::default_params());
+    let mut vchan = VerifierChannel::new(v_tr);
+
+    // Build Merkle + MLE verifier to reuse the same transcript flow as SumCheckVerifier.
+    let merkle_cfg = MerkleChannelCfg::with_default_params(F::from(vk.tree_label));
+    let mut mv = MerkleVerifier::new(&mut vchan, merkle_cfg.clone());
+
+    // Receive root exactly as prover sent it.
+    let root_f: F = F::try_from(&proof.root).expect("Fr");
+    mv.receive_root(&root_f);
+
+    // Initialize MLE verifier with k from VK.
+    let mut mle_v = MleVerifier::new(mv, vk.k);
+
+    // Construct sum-check verifier using the same helper.
+    let mut sv = SumCheckVerifier::new(mle_v);
+
+    // Reconstruct and bind the initial claim s = sum of leaf values via the protocol’s binding.
+    // Note: Prover bound s to transcript via sp.send_claim(); the verifier needs the same value.
+    // We must recompute s_prev from the first (c0,c1) as 2*c0 + c1 and bind it.
+    if proof.rounds.is_empty() {
+        return false;
+    }
+    let (c0_b0, c1_b0) = &proof.rounds[0];
+    let c0_0: F = F::try_from(c0_b0).expect("Fr");
+    let c1_0: F = F::try_from(c1_b0).expect("Fr");
+    let s0 = F::from(2u64) * c0_0 + c1_0;
+    sv.recv_claim(&s0);
+
+    // Drive rounds using the exact verifier API, labels, and order.
+    let mut running = s0;
+    for (i, (c0_b, c1_b)) in proof.rounds.iter().enumerate() {
+        let c0: F = F::try_from(c0_b).expect("Fr");
+        let c1: F = F::try_from(c1_b).expect("Fr");
+
+        let (_r_i, s_next) = sv.round(i, running, c0, c1, b"sumcheck/r");
+        running = s_next;
+    }
+
+    // Finalize: bind final eval and check equality to running s_k.
+    let final_eval: F = F::try_from(&proof.final_eval).expect("Fr");
+    sv.finalize_and_check(final_eval, running);
+    true
+}
+
+// PROVE (MF)
+
+pub fn prove_mf(vk: &VK, witness: &[F]) -> ProofMF {
+    let queries_per_round = match vk.variant {
+        VKVariant::SumCheckMF { queries_per_round } => queries_per_round,
+        _ => panic!("wrong VK variant"),
+    };
+
+    let p_tr = Transcript::new(b"E2E/MF", transcript::default_params());
+    let mut pchan = ProverChannel::new(p_tr);
+
+    let merkle_cfg = MerkleChannelCfg::with_default_params(F::from(vk.tree_label));
+    let mle = Mle::new(witness.to_vec());
+
+    let cfg = SumCheckMFConfig { queries_per_round };
+    let mut sp = SumCheckMFProver::new(cfg, merkle_cfg.clone(), &mut pchan, &mle);
+
+    let initial_root_f = sp.current_root();
+    let _s = sp.send_claim();
+
+    let mut rounds: Vec<RoundMF> = Vec::with_capacity(vk.k);
+
+    for i in 0..vk.k {
+        let (c0, c1, _r_i, next_root, openings) = sp.round(i);
+        rounds.push(RoundMF {
+            c0: FBytes::from(c0),
+            c1: FBytes::from(c1),
+            next_root: FBytes::from(next_root),
+            cur_indices: openings.cur_indices,
+            cur_values: openings.cur_values.into_iter().map(FBytes::from).collect(),
+            cur_proof: merkle_proof_to_bytes(&openings.cur_proof),
+            next_indices: openings.next_indices,
+            next_values: openings.next_values.into_iter().map(FBytes::from).collect(),
+            next_proof: merkle_proof_to_bytes(&openings.next_proof),
+        });
+    }
+
+    let final_eval_f = sp.finalize_eval();
+
+    ProofMF {
+        initial_root: FBytes::from(initial_root_f),
+        rounds,
+        final_eval: FBytes::from(final_eval_f),
+    }
+}
+
+// VERIFY (MF)
+
+pub fn verify_mf(vk: &VK, proof: &ProofMF) -> bool {
+    let queries_per_round = match vk.variant {
+        VKVariant::SumCheckMF { queries_per_round } => queries_per_round,
+        _ => return false,
+    };
+
+    let v_tr = Transcript::new(b"E2E/MF", transcript::default_params());
+    let mut vchan = VerifierChannel::new(v_tr);
+
+    let merkle_cfg = MerkleChannelCfg::with_default_params(F::from(vk.tree_label));
+    let init_root_f: F = F::try_from(&proof.initial_root).expect("Fr");
+
+    let mut sv = SumCheckMFVerifier::new(
+        SumCheckMFConfig { queries_per_round },
+        merkle_cfg.clone(),
+        &mut vchan,
+        init_root_f,
+        vk.k,
+    );
+
+    sv.receive_initial_root(&init_root_f);
+
+    let mut running: Option<F> = None;
+    let mut prev_root = init_root_f;
+
+    for (i, r) in proof.rounds.iter().enumerate() {
+        let c0: F = F::try_from(&r.c0).expect("Fr");
+        let c1: F = F::try_from(&r.c1).expect("Fr");
+        let next_root_f: F = F::try_from(&r.next_root).expect("Fr");
+
+        sv.start_round(i, running.unwrap_or(F::from(2u64) * c0 + c1), c0, c1);
+
+        let r_i = sv.derive_round_challenge(i);
+
+        sv.recv_next_root(next_root_f);
+
+        let cur_proof = merkle_proof_from_bytes(&r.cur_proof);
+        let next_proof = merkle_proof_from_bytes(&r.next_proof);
+        let cur_values: Vec<F> = r.cur_values.iter().map(|b| F::try_from(b).expect("Fr")).collect();
+        let next_values: Vec<F> = r.next_values.iter().map(|b| F::try_from(b).expect("Fr")).collect();
+
+        let ok = sv.verify_fold_openings(
+            &r.cur_indices,
+            &cur_values,
+            &cur_proof,
+            &r.next_indices,
+            &next_values,
+            &next_proof,
+            r_i,
+            prev_root,
+            next_root_f,
+        );
+        if !ok {
+            return false;
+        }
+
+        let s_next = sv.compute_s_next(c0, c1, r_i);
+        running = Some(s_next);
+        prev_root = next_root_f;
+    }
+
+    let final_eval_f: F = F::try_from(&proof.final_eval).expect("Fr");
+    sv.finalize_and_check(final_eval_f, running.unwrap_or(final_eval_f));
+    true
+}
+
 // -------------------------
 // Tests
 // -------------------------
