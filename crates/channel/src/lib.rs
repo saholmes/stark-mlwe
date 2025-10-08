@@ -146,7 +146,7 @@ impl MerkleChannelCfg {
     }
 }
 
-pub struct MerkleProver <'a> {
+pub struct MerkleProver<'a> {
     chan: &'a mut ProverChannel,
     cfg: MerkleChannelCfg,
     root: Option<MerkleRoot>,
@@ -561,7 +561,7 @@ struct FoldedLayer {
     root: F,
 }
 
-pub struct SumCheckMFProver<'a> {
+pub struct SumCheckMFProver <'a> {
     cfg: SumCheckMFConfig,
     merkle_cfg: MerkleChannelCfg,
     chan: &'a mut ProverChannel,
@@ -668,7 +668,6 @@ impl<'a> SumCheckMFProver<'a> {
             qlabel.extend_from_slice(b"sumcheck-mf/q");
             qlabel.extend_from_slice(&i.to_le_bytes());
             qlabel.extend_from_slice(&(j as u64).to_le_bytes());
-            use ark_ff::PrimeField;
             let r = self.chan.challenge_scalar(&qlabel);
             let bytes = r.into_bigint().to_bytes_le();
             let mut acc = 0u64;
@@ -736,6 +735,14 @@ impl<'a> SumCheckMFProver<'a> {
         self.chan.transcript_mut().absorb_bytes(b"SUMCHECK/MF/FINAL/EVAL");
         self.chan.transcript_mut().absorb_field(val);
         val
+    }
+
+    // Public getters for benches (keep fields private)
+    pub fn current_root(&self) -> F {
+        self.cur.root
+    }
+    pub fn num_rounds(&self) -> usize {
+        self.rounds
     }
 }
 
@@ -863,6 +870,11 @@ impl<'a> SumCheckMFVerifier<'a> {
 
     pub fn current_root(&self) -> F {
         self.cur_root
+    }
+
+    // Public getter for benches
+    pub fn rounds(&self) -> usize {
+        self.rounds
     }
 }
 
@@ -1014,7 +1026,7 @@ mod tests {
 
         let mut sp = SumCheckMFProver::new(cfg, merkle_cfg.clone(), &mut pchan, &mle);
 
-        let init_root = sp.cur.root;
+        let init_root = sp.current_root();
         let mut sv =
             SumCheckMFVerifier::new(cfg, merkle_cfg.clone(), &mut vchan, init_root, k);
         sv.receive_initial_root(&init_root);

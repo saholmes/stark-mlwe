@@ -10,3 +10,11 @@ ark-bls12-381 = { workspace = true }
 utils = { path = "../utils" }
 field = { path = "../field" }
 ark-pallas = "0.5"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+
+[[bench]]
+name = "poseidon"
+harness = false

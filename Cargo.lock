@@ -372,6 +372,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -418,7 +427,9 @@ version = "0.1.0"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-pallas 0.5.0",
+ "bincode",
  "commitment",
+ "criterion",
  "field",
  "poseidon",
  "rand",
@@ -812,6 +823,8 @@ dependencies = [
  "ark-ff 0.5.0",
  "ark-pallas 0.5.0",
  "ark-serialize 0.5.0",
+ "bincode",
+ "criterion",
  "field",
  "poseidon",
  "rand",
@@ -928,7 +941,9 @@ dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
  "ark-pallas 0.5.0",
+ "criterion",
  "field",
+ "rand",
  "utils",
 ]
 
