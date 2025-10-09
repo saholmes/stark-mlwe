@@ -130,16 +130,23 @@ pub struct MerkleTree {
     pub cfg: Option<MerkleChannelCfg>,
 }
 
+// Union-of-paths multiproof (single representation used by both single-column and pair-leaf trees).
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct MerkleProof {
+    // Requested leaf indices in ascending order (unique).
     pub indices: Vec<usize>,
+    // For each level ℓ, siblings[ℓ] is a flat list of sibling node digests needed
+    // to complete all parents touched at that level (union-of-paths).
     pub siblings: Vec<Vec<SerFr>>,
+    // For each level ℓ, group_sizes[ℓ] lists, in order, the child_count for each touched parent.
+    // This drives reconstruction deterministically.
     pub group_sizes: Vec<Vec<u8>>,
+    // Arity of the tree.
     pub arity: usize,
 }
 
 impl MerkleTree {
-    // New API: explicit cfg with dynamic params and DS hygiene.
+    // ========== Single-column DS-aware constructor ==========
     pub fn new(leaves: Vec<F>, cfg: MerkleChannelCfg) -> Self {
         assert!(!leaves.is_empty(), "no leaves");
         let arity = cfg.arity;
@@ -148,22 +155,12 @@ impl MerkleTree {
         levels.push(leaves);
 
         let t = cfg.params.t;
-        // Enforce supported profiles rather than t = arity + 1 for small arities.
         if arity <= 8 {
-            assert_eq!(
-                t, 9,
-                "for arity <= 8, use t=9 Poseidon params; got t={}",
-                t
-            );
+            assert_eq!(t, 9, "for arity <= 8, use t=9 Poseidon params; got t={}", t);
         } else {
-            assert_eq!(
-                t, 17,
-                "for arity >= 16, use t=17 Poseidon params; got t={}",
-                t
-            );
+            assert_eq!(t, 17, "for arity >= 16, use t=17 Poseidon params; got t={}", t);
         }
 
-        // Build levels using DS labels: level index starts at 0 for parents of leaves.
         let mut cur_level = 0u32;
         while levels.last().unwrap().len() > 1 {
             let cur = levels.last().unwrap();
@@ -186,13 +183,11 @@ impl MerkleTree {
         MerkleTree {
             leaves: levels[0].iter().copied().map(SerFr::from).collect(),
             root: SerFr(root),
-            // Legacy ds_tag kept for serde compatibility; zero by default under new API.
             ds_tag: SerFr(F::from(0u64)),
             levels: levels
                 .into_iter()
                 .map(|v| v.into_iter().map(SerFr::from).collect())
                 .collect(),
-            // Legacy fixed params retained; used only by legacy verify/new_legacy.
             params: default_params(),
             cfg: Some(cfg),
         }
@@ -248,14 +243,18 @@ impl MerkleTree {
         }
     }
 
-    pub fn open_many(&self, indices: &[usize]) -> MerkleProof {
+    // ========== Union-of-paths encoder used by both single and pair paths ==========
+    fn open_union_of_paths(&self, indices: &[usize]) -> MerkleProof {
         assert!(!indices.is_empty(), "open_many: empty indices");
         let arity = self.arity();
 
         let leaf_count = self.levels[0].len();
         debug_assert!(indices.iter().all(|&i| i < leaf_count));
 
+        // Work on sorted unique indices
         let mut cur_indices: Vec<usize> = indices.to_vec();
+        cur_indices.sort_unstable();
+        cur_indices.dedup();
 
         let mut siblings_per_level: Vec<Vec<SerFr>> = Vec::with_capacity(self.height());
         let mut group_sizes_per_level: Vec<Vec<u8>> = Vec::with_capacity(self.height());
@@ -304,11 +303,26 @@ impl MerkleTree {
         }
 
         MerkleProof {
-            indices: indices.to_vec(),
+            indices: {
+                let mut idx = indices.to_vec();
+                idx.sort_unstable();
+                idx.dedup();
+                idx
+            },
             siblings: siblings_per_level,
             group_sizes: group_sizes_per_level,
             arity,
         }
+    }
+
+    // ========== Single-column: open many (multiproof) ==========
+    pub fn open_many_single(&self, indices: &[usize]) -> MerkleProof {
+        self.open_union_of_paths(indices)
+    }
+
+    // Existing multiproof (used by legacy and pairs). Kept for compatibility.
+    pub fn open_many(&self, indices: &[usize]) -> MerkleProof {
+        self.open_union_of_paths(indices)
     }
 
     // Debug-only consistency checker: recompute level parents and compare.
@@ -355,14 +369,13 @@ pub fn default_params() -> PoseidonParams {
     generate_params_t17_x5(seed)
 }
 
-// ========== Milestone 2: Combined-leaf hashing (pack (f, cp) into a single absorb) ==========
+// ========== Combined-leaf hashing (pack (f, cp) into a single absorb) ==========
 
 fn encode_leaf_digest_legacy(f: F, cp: F, ds_tag: F, params: &PoseidonParams) -> F {
-    // One hash call absorbing [f, cp], returning one digest element.
     hash_with_ds(&[f, cp], ds_tag, params)
 }
 
-// For DS-aware encoding, we dedicate a special level marker for leaves to avoid ambiguity with internal node levels.
+// For DS-aware encoding, dedicate a special level marker for leaves.
 const LEAF_LEVEL_DS: u32 = u32::MAX;
 
 fn encode_leaf_digest_ds(index: usize, cfg: &MerkleChannelCfg, f: F, cp: F) -> F {
@@ -382,30 +395,20 @@ impl MerkleTree {
         assert!(!f_vals.is_empty(), "no leaves");
         let n = f_vals.len();
 
-        // Compute leaf digests from pairs with DS-aware leaf DS.
         let mut level0: Vec<F> = Vec::with_capacity(n);
         for i in 0..n {
             level0.push(encode_leaf_digest_ds(i, &cfg, f_vals[i], cp_vals[i]));
         }
 
-        // Reuse DS-aware internal-node building from new(), but starting from precomputed level 0.
         let arity = cfg.arity;
         let mut levels: Vec<Vec<F>> = Vec::new();
         levels.push(level0);
 
         let t = cfg.params.t;
         if arity <= 8 {
-            assert_eq!(
-                t, 9,
-                "for arity <= 8, use t=9 Poseidon params; got t={}",
-                t
-            );
+            assert_eq!(t, 9, "for arity <= 8, use t=9 Poseidon params; got t={}", t);
         } else {
-            assert_eq!(
-                t, 17,
-                "for arity >= 16, use t=17 Poseidon params; got t={}",
-                t
-            );
+            assert_eq!(t, 17, "for arity >= 16, use t=17 Poseidon params; got t={}", t);
         }
 
         let mut cur_level = 0u32; // 0 = parents of leaves
@@ -440,20 +443,18 @@ impl MerkleTree {
         }
     }
 
-    // Legacy combined-leaf constructor: fixed t=17, leaf digest = Poseidon([f,cp]) with ds_tag in capacity.
+    // Legacy combined-leaf constructor
     pub fn new_pairs_legacy(f_vals: &[F], cp_vals: &[F], ds_tag: F, params: PoseidonParams) -> Self {
         assert_eq!(f_vals.len(), cp_vals.len(), "f and cp length mismatch");
         assert!(!f_vals.is_empty(), "no leaves");
         let n = f_vals.len();
 
-        // Compute leaf digests from pairs in legacy mode.
         let mut level0: Vec<F> = Vec::with_capacity(n);
         for i in 0..n {
             let d = encode_leaf_digest_legacy(f_vals[i], cp_vals[i], ds_tag, &params);
             level0.push(d);
         }
 
-        // Build internal nodes exactly as legacy new_legacy would (group by RATE=16).
         let mut levels: Vec<Vec<F>> = Vec::new();
         levels.push(level0);
         while levels.last().unwrap().len() > 1 {
@@ -481,6 +482,7 @@ impl MerkleTree {
     }
 }
 
+// ========== Legacy verifications (unchanged behavior) ==========
 pub fn verify_many(
     root: &F,
     indices: &[usize],
@@ -489,11 +491,14 @@ pub fn verify_many(
     ds_tag: F,
     params: PoseidonParams,
 ) -> bool {
-    // Legacy-only verification (matches original API and tests).
     if indices.is_empty() || indices.len() != values.len() {
         return false;
     }
-    if proof.indices != indices {
+    // We accept indices in any order from the caller, but proof.indices is unique-sorted.
+    let mut req = indices.to_vec();
+    req.sort_unstable();
+    req.dedup();
+    if proof.indices != req {
         return false;
     }
     if proof.siblings.len() != proof.group_sizes.len() {
@@ -501,11 +506,18 @@ pub fn verify_many(
     }
     let arity = proof.arity;
 
-    let mut cur_indices = indices.to_vec();
-    let mut cur_values = values.to_vec();
+    // Prepare current frontier exactly over the requested (unique-sorted) set.
+    let mut cur_indices = req;
+    // Map the original indices -> value; then assemble leaves aligned to cur_indices order.
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<usize, F> = BTreeMap::new();
+    for (&i, &v) in indices.iter().zip(values.iter()) {
+        map.insert(i, v);
+    }
+    let mut cur_values: Vec<F> = cur_indices.iter().map(|i| map[i]).collect();
 
-    for (level_siblings, level_group_sizes) in proof.siblings.iter().zip(proof.group_sizes.iter()) {
-        use std::collections::BTreeMap;
+    for (level_siblings, level_group_sizes) in proof.siblings.iter().zip(proof.group_sizes.iter())
+    {
         let mut groups: BTreeMap<usize, Vec<(usize, F)>> = BTreeMap::new();
         for (idx, val) in cur_indices.iter().copied().zip(cur_values.iter().copied()) {
             let p = idx / arity;
@@ -570,7 +582,7 @@ pub fn verify_many(
     cur_values[0] == *root
 }
 
-// New DS-hygienic verification API (explicit).
+// New DS-hygienic verification API (explicit) for single-column values.
 pub fn verify_many_ds(
     root: &F,
     indices: &[usize],
@@ -582,7 +594,10 @@ pub fn verify_many_ds(
     if indices.is_empty() || indices.len() != values.len() {
         return false;
     }
-    if proof.indices != indices {
+    let mut req = indices.to_vec();
+    req.sort_unstable();
+    req.dedup();
+    if proof.indices != req {
         return false;
     }
     if proof.siblings.len() != proof.group_sizes.len() {
@@ -590,14 +605,19 @@ pub fn verify_many_ds(
     }
     let arity = proof.arity;
 
-    // Enforce the same supported-profile rule used by the tree.
     let t = dyn_params.t;
     if (arity <= 8 && t != 9) || (arity > 8 && t != 17) {
         return false;
     }
 
-    let mut cur_indices = indices.to_vec();
-    let mut cur_values = values.to_vec();
+    // Align leaves to proof.indices order.
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<usize, F> = BTreeMap::new();
+    for (&i, &v) in indices.iter().zip(values.iter()) {
+        map.insert(i, v);
+    }
+    let mut cur_indices = req;
+    let mut cur_values: Vec<F> = cur_indices.iter().map(|i| map[i]).collect();
 
     for (level, (level_siblings, level_group_sizes)) in
         proof.siblings.iter().zip(proof.group_sizes.iter()).enumerate()
@@ -685,7 +705,6 @@ pub fn verify_pairs_legacy(
     if indices.len() != pairs.len() || indices.is_empty() {
         return false;
     }
-    // Compute leaf digests in the same order as indices.
     let leaves: Vec<F> = pairs
         .iter()
         .map(|&(f, cp)| encode_leaf_digest_legacy(f, cp, ds_tag, &params))
@@ -712,11 +731,21 @@ pub fn verify_pairs_ds(
         return false;
     }
 
-    // Recompute leaf digests using the agreed DS policy (LEAF_LEVEL_DS).
-    let leaves: Vec<F> = indices
+    // Recompute leaf digests using DS policy (LEAF_LEVEL_DS).
+    // Align leaves to proof.indices order to match union-of-paths verifier expectations.
+    let mut req = indices.to_vec();
+    req.sort_unstable();
+    req.dedup();
+
+    use std::collections::BTreeMap;
+    let mut mpairs: BTreeMap<usize, (F, F)> = BTreeMap::new();
+    for (&i, &p) in indices.iter().zip(pairs.iter()) {
+        mpairs.insert(i, p);
+    }
+    let leaves: Vec<F> = req
         .iter()
-        .zip(pairs.iter())
-        .map(|(&idx, &(f, cp))| {
+        .map(|&idx| {
+            let (f, cp) = mpairs[&idx];
             let ds = DsLabel {
                 arity,
                 level: LEAF_LEVEL_DS,
@@ -727,7 +756,7 @@ pub fn verify_pairs_ds(
         })
         .collect();
 
-    verify_many_ds(root, indices, &leaves, proof, tree_label, dyn_params)
+    verify_many_ds(root, &req, &leaves, proof, tree_label, dyn_params)
 }
 
 // ========== Small facades for ergonomics ==========
@@ -741,6 +770,35 @@ impl MerkleProver {
         Self { cfg }
     }
 
+    // Commit a vector of single-column leaves (already digests or raw values you wish to commit).
+    pub fn commit_single(&self, leaves: &[F]) -> (F, MerkleTree) {
+        let tree = MerkleTree::new(leaves.to_vec(), self.cfg.clone());
+        (tree.root(), tree)
+    }
+
+    // Open single-column leaves at given indices (union-of-paths multiproof).
+    pub fn open_single(&self, tree: &MerkleTree, indices: &[usize]) -> MerkleProof {
+        tree.open_many_single(indices)
+    }
+
+    // Verify single-column union-of-paths proof with DS-aware hashing.
+    pub fn verify_single(
+        &self,
+        root: &F,
+        indices: &[usize],
+        leaves: &[F],
+        proof: &MerkleProof,
+    ) -> bool {
+        verify_many_ds(
+            root,
+            indices,
+            leaves,
+            proof,
+            self.cfg.tree_label,
+            self.cfg.params.clone(),
+        )
+    }
+
     // Commit a vector of pairs (f, cp) as combined leaves; returns root and the constructed tree.
     pub fn commit_pairs(&self, f_vals: &[F], cp_vals: &[F]) -> (F, MerkleTree) {
         let tree = MerkleTree::new_pairs(f_vals, cp_vals, self.cfg.clone());
@@ -748,7 +806,6 @@ impl MerkleProver {
     }
 
     // Open a set of indices; returns the original pairs at those indices and the Merkle proof.
-    // Note: this function assumes the caller provides the original arrays to extract pairs.
     pub fn open_pairs(
         &self,
         tree: &MerkleTree,
@@ -758,8 +815,11 @@ impl MerkleProver {
     ) -> (Vec<(F, F)>, MerkleProof) {
         assert_eq!(f_vals.len(), cp_vals.len(), "length mismatch");
         assert!(!indices.is_empty(), "empty indices");
-        let pairs: Vec<(F, F)> = indices.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
-        let proof = tree.open_many(indices);
+        let mut uniq = indices.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let pairs: Vec<(F, F)> = uniq.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+        let proof = tree.open_many(&uniq);
         (pairs, proof)
     }
 
@@ -805,8 +865,11 @@ impl LegacyMerkleProver {
     ) -> (Vec<(F, F)>, MerkleProof) {
         assert_eq!(f_vals.len(), cp_vals.len(), "length mismatch");
         assert!(!indices.is_empty(), "empty indices");
-        let pairs: Vec<(F, F)> = indices.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
-        let proof = tree.open_many(indices);
+        let mut uniq = indices.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let pairs: Vec<(F, F)> = uniq.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
+        let proof = tree.open_many(&uniq);
         (pairs, proof)
     }
 
@@ -843,11 +906,12 @@ mod tests {
         let ds = F::from(77u64);
         let tree = MerkleTree::new_legacy(leaves.clone(), ds, params.clone());
 
-        // Sanity: level-0 consistency
         assert!(tree.check_level_consistency(0));
 
         let root = tree.root();
-        let idx = vec![0usize, 3, 7, 11, 54];
+        let mut idx = vec![0usize, 3, 7, 11, 54];
+        idx.sort_unstable();
+        idx.dedup();
         let vals: Vec<F> = idx.iter().map(|&i| leaves[i]).collect();
         let proof = tree.open_many(&idx);
         assert!(verify_many(&root, &idx, &vals, &proof, ds, params));
@@ -862,18 +926,18 @@ mod tests {
         let cfg = MerkleChannelCfg::new(16).with_tree_label(42);
         let tree = MerkleTree::new(leaves.clone(), cfg.clone());
 
-        // Sanity: consistency across a couple of levels
         assert!(tree.check_level_consistency(0));
         if tree.height() >= 2 {
             assert!(tree.check_level_consistency(1));
         }
 
         let root = tree.root();
-        let idx = vec![0usize, 15, 16, 31, 47, 63];
+        let mut idx = vec![0usize, 15, 16, 31, 47, 63];
+        idx.sort_unstable();
+        idx.dedup();
         let vals: Vec<F> = idx.iter().map(|&i| leaves[i]).collect();
-        let proof = tree.open_many(&idx);
+        let proof = tree.open_many_single(&idx);
 
-        // DS-aware verification with explicit params and tree_label.
         let dyn_params = poseidon_params_for_width(16 + 1);
         assert!(verify_many_ds(
             &root,
@@ -887,10 +951,8 @@ mod tests {
 
     #[test]
     fn test_poseidon_params_roundtrip_t17() {
-        // t = 17 (arity = 16), alpha=5, RF=8, RP=64
         let params = poseidon_params_for_width(17);
 
-        // Fixed children and DS fields
         let children: Vec<F> = (0..16).map(|i| F::from(i as u64 + 1)).collect();
         let arity = 16usize;
         let level = 0u32;
@@ -905,56 +967,37 @@ mod tests {
         };
         let digest1 = hash_with_ds_dynamic(&ds.to_fields(), &children, &params);
         let digest2 = hash_with_ds_dynamic(&ds.to_fields(), &children, &params);
-        assert_eq!(digest1, digest2, "same inputs and DS should be stable");
+        assert_eq!(digest1, digest2);
 
-        // Change DS: level
-        let ds_level = DsLabel {
-            level: level + 1,
-            ..ds
-        };
+        let ds_level = DsLabel { level: level + 1, ..ds };
         let d_level = hash_with_ds_dynamic(&ds_level.to_fields(), &children, &params);
-        assert_ne!(digest1, d_level, "changing level must change digest");
+        assert_ne!(digest1, d_level);
 
-        // Change DS: position
-        let ds_pos = DsLabel {
-            position: position + 1,
-            ..ds
-        };
+        let ds_pos = DsLabel { position: position + 1, ..ds };
         let d_pos = hash_with_ds_dynamic(&ds_pos.to_fields(), &children, &params);
-        assert_ne!(digest1, d_pos, "changing position must change digest");
+        assert_ne!(digest1, d_pos);
 
-        // Change DS: tree_label
-        let ds_tree = DsLabel {
-            tree_label: tree_label + 1,
-            ..ds
-        };
+        let ds_tree = DsLabel { tree_label: tree_label + 1, ..ds };
         let d_tree = hash_with_ds_dynamic(&ds_tree.to_fields(), &children, &params);
-        assert_ne!(digest1, d_tree, "changing tree_label must change digest");
+        assert_ne!(digest1, d_tree);
 
-        // Change DS: arity (conceptual change of domain)
         let ds_arity8 = DsLabel { arity: 8, ..ds };
         let d_arity8 = hash_with_ds_dynamic(&ds_arity8.to_fields(), &children, &params);
-        assert_ne!(digest1, d_arity8, "changing arity in DS must change digest");
+        assert_ne!(digest1, d_arity8);
 
-        // Fewer-than-rate children
         let fewer_children: Vec<F> = (0..5).map(|i| F::from(i as u64 + 1)).collect();
         let digest_few_1 = hash_with_ds_dynamic(&ds.to_fields(), &fewer_children, &params);
         let digest_few_2 = hash_with_ds_dynamic(&ds.to_fields(), &fewer_children, &params);
-        assert_eq!(digest_few_1, digest_few_2, "stability for partial block");
+        assert_eq!(digest_few_1, digest_few_2);
 
-        // Appending an explicit zero element changes the digest (different message)
         let mut with_extra_zero = fewer_children.clone();
         with_extra_zero.push(F::zero());
         let digest_with_extra = hash_with_ds_dynamic(&ds.to_fields(), &with_extra_zero, &params);
-        assert_ne!(
-            digest_few_1, digest_with_extra,
-            "appending an extra zero element changes the digest (distinct message)"
-        );
+        assert_ne!(digest_few_1, digest_with_extra);
     }
 
     #[test]
     fn test_poseidon_params_roundtrip_t9() {
-        // t = 9 (arity = 8), alpha=5, RF=8, RP=60
         let params = poseidon_params_for_width(9);
 
         let children: Vec<F> = (0..8).map(|i| F::from(i as u64 + 11)).collect();
@@ -973,48 +1016,18 @@ mod tests {
         let digest2 = hash_with_ds_dynamic(&ds.to_fields(), &children, &params);
         assert_eq!(digest1, digest2);
 
-        // Change each DS field separately
-        let d_level = hash_with_ds_dynamic(
-            &DsLabel {
-                level: level + 1,
-                ..ds
-            }
-            .to_fields(),
-            &children,
-            &params,
-        );
+        let d_level = hash_with_ds_dynamic(&DsLabel { level: level + 1, ..ds }.to_fields(), &children, &params);
         assert_ne!(digest1, d_level);
 
-        let d_pos = hash_with_ds_dynamic(
-            &DsLabel {
-                position: position + 1,
-                ..ds
-            }
-            .to_fields(),
-            &children,
-            &params,
-        );
+        let d_pos = hash_with_ds_dynamic(&DsLabel { position: position + 1, ..ds }.to_fields(), &children, &params);
         assert_ne!(digest1, d_pos);
 
-        let d_tree = hash_with_ds_dynamic(
-            &DsLabel {
-                tree_label: tree_label + 1,
-                ..ds
-            }
-            .to_fields(),
-            &children,
-            &params,
-        );
+        let d_tree = hash_with_ds_dynamic(&DsLabel { tree_label: tree_label + 1, ..ds }.to_fields(), &children, &params);
         assert_ne!(digest1, d_tree);
 
-        let d_arity16 = hash_with_ds_dynamic(
-            &DsLabel { arity: 16, ..ds }.to_fields(),
-            &children,
-            &params,
-        );
+        let d_arity16 = hash_with_ds_dynamic(&DsLabel { arity: 16, ..ds }.to_fields(), &children, &params);
         assert_ne!(digest1, d_arity16);
 
-        // Partial-rate case
         let fewer_children: Vec<F> = (0..3).map(|i| F::from(i as u64 + 21)).collect();
         let digest_few = hash_with_ds_dynamic(&ds.to_fields(), &fewer_children, &params);
         let mut with_extra_zero = fewer_children.clone();
@@ -1025,84 +1038,40 @@ mod tests {
 
     #[test]
     fn merkle_ds_hygiene_negatives_arity16() {
-        // Build a small DS-aware arity-16 tree and test DS sensitivity.
         let leaves: Vec<F> = (1..=32).map(|x| F::from(x as u64)).collect();
         let cfg = MerkleChannelCfg::new(16).with_tree_label(1234);
         let tree = MerkleTree::new(leaves.clone(), cfg.clone());
 
-        // Check level-0 consistency: parents of leaves computed via DS-aware hash
         assert!(tree.check_level_consistency(0));
 
-        // Recompute a specific parent at level 0 manually and test DS changes
         let arity = cfg.arity;
         let level0 = 0u32;
-        let parent_idx = 1usize; // second parent at level 0
+        let parent_idx = 1usize;
         let base = parent_idx * arity;
         let end = core::cmp::min(base + arity, tree.levels[0].len());
         let children: Vec<F> = tree.levels[0][base..end].iter().map(|w| w.0).collect();
 
-        let ds = DsLabel {
-            arity,
-            level: level0,
-            position: parent_idx as u64,
-            tree_label: cfg.tree_label,
-        };
+        let ds = DsLabel { arity, level: level0, position: parent_idx as u64, tree_label: cfg.tree_label };
         let parent_digest = hash_with_ds_dynamic(&ds.to_fields(), &children, &cfg.params);
-        assert_eq!(
-            parent_digest, tree.levels[1][parent_idx].0,
-            "baseline parent digest matches"
-        );
+        assert_eq!(parent_digest, tree.levels[1][parent_idx].0);
 
-        // Negative: change level
-        let d2 = hash_with_ds_dynamic(
-            &DsLabel {
-                level: level0 + 1,
-                ..ds
-            }
-            .to_fields(),
-            &children,
-            &cfg.params,
-        );
-        assert_ne!(parent_digest, d2, "changing level must change digest");
+        let d2 = hash_with_ds_dynamic(&DsLabel { level: level0 + 1, ..ds }.to_fields(), &children, &cfg.params);
+        assert_ne!(parent_digest, d2);
 
-        // Negative: change position
-        let d3 = hash_with_ds_dynamic(
-            &DsLabel {
-                position: (parent_idx as u64) + 1,
-                ..ds
-            }
-            .to_fields(),
-            &children,
-            &cfg.params,
-        );
-        assert_ne!(parent_digest, d3, "changing position must change digest");
+        let d3 = hash_with_ds_dynamic(&DsLabel { position: (parent_idx as u64) + 1, ..ds }.to_fields(), &children, &cfg.params);
+        assert_ne!(parent_digest, d3);
 
-        // Negative: change tree_label
-        let d4 = hash_with_ds_dynamic(
-            &DsLabel {
-                tree_label: cfg.tree_label + 1,
-                ..ds
-            }
-            .to_fields(),
-            &children,
-            &cfg.params,
-        );
-        assert_ne!(parent_digest, d4, "changing tree_label must change digest");
+        let d4 = hash_with_ds_dynamic(&DsLabel { tree_label: cfg.tree_label + 1, ..ds }.to_fields(), &children, &cfg.params);
+        assert_ne!(parent_digest, d4);
 
-        // Negative: shuffle children order
         let mut shuffled = children.clone();
-        if shuffled.len() >= 2 {
-            shuffled.swap(0, 1);
-        }
+        if shuffled.len() >= 2 { shuffled.swap(0, 1); }
         let d5 = hash_with_ds_dynamic(&ds.to_fields(), &shuffled, &cfg.params);
-        assert_ne!(parent_digest, d5, "shuffling children must change digest");
+        assert_ne!(parent_digest, d5);
     }
-
-    // ========== Milestone 2 tests: combined-leaf (f, cp) encoded in one absorb) ==========
 
     #[test]
     fn test_combined_leaf_commit_open_legacy() {
-        // Legacy combined leaves: build, open, verify.
         let mut rng = StdRng::seed_from_u64(2024);
         let n = 37usize;
         let f_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
@@ -1113,8 +1082,9 @@ mod tests {
         let tree = MerkleTree::new_pairs_legacy(&f_vals, &cp_vals, ds_tag, params.clone());
         let root = tree.root();
 
-        // Select some indices
-        let idx = vec![0usize, 1, 5, 19, 36];
+        let mut idx = vec![0usize, 1, 5, 19, 36];
+        idx.sort_unstable();
+        idx.dedup();
         let pairs: Vec<(F, F)> = idx.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
 
         let proof = tree.open_many(&idx);
@@ -1123,7 +1093,6 @@ mod tests {
 
     #[test]
     fn test_combined_leaf_commit_open_ds_arity16() {
-        // DS-aware combined leaves: arity=16
         let mut rng = StdRng::seed_from_u64(2025);
         let n = 64usize;
         let f_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
@@ -1133,21 +1102,15 @@ mod tests {
         let tree = MerkleTree::new_pairs(&f_vals, &cp_vals, cfg.clone());
         let root = tree.root();
 
-        let idx = vec![0usize, 7, 16, 31, 63];
+        let mut idx = vec![0usize, 7, 16, 31, 63];
+        idx.sort_unstable();
+        idx.dedup();
         let pairs: Vec<(F, F)> = idx.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
         let proof = tree.open_many(&idx);
 
         let dyn_params = poseidon_params_for_width(16 + 1);
-        assert!(verify_pairs_ds(
-            &root,
-            &idx,
-            &pairs,
-            &proof,
-            cfg.tree_label,
-            dyn_params
-        ));
+        assert!(verify_pairs_ds(&root, &idx, &pairs, &proof, cfg.tree_label, dyn_params));
 
-        // Negative sanity: alter cp of one pair -> verification fails
         let mut tampered = pairs.clone();
         tampered[0].1 += F::from(1u64);
         assert!(!verify_pairs_ds(
@@ -1162,7 +1125,6 @@ mod tests {
 
     #[test]
     fn test_combined_leaf_commit_open_ds_arity8() {
-        // DS-aware combined leaves: arity=8 (t=9)
         let mut rng = StdRng::seed_from_u64(3030);
         let n = 32usize;
         let f_vals: Vec<F> = (0..n).map(|_| F::rand(&mut rng)).collect();
@@ -1172,21 +1134,15 @@ mod tests {
         let tree = MerkleTree::new_pairs(&f_vals, &cp_vals, cfg.clone());
         let root = tree.root();
 
-        let idx = vec![0usize, 3, 7, 8, 15, 23, 31];
+        let mut idx = vec![0usize, 3, 7, 8, 15, 23, 31];
+        idx.sort_unstable();
+        idx.dedup();
         let pairs: Vec<(F, F)> = idx.iter().map(|&i| (f_vals[i], cp_vals[i])).collect();
         let proof = tree.open_many(&idx);
 
         let dyn_params = poseidon_params_for_width(8 + 1);
-        assert!(verify_pairs_ds(
-            &root,
-            &idx,
-            &pairs,
-            &proof,
-            cfg.tree_label,
-            dyn_params
-        ));
+        assert!(verify_pairs_ds(&root, &idx, &pairs, &proof, cfg.tree_label, dyn_params));
 
-        // Tamper one f value should fail
         let mut tampered = pairs.clone();
         tampered[2].0 += F::from(1u64);
         assert!(!verify_pairs_ds(
@@ -1198,12 +1154,18 @@ mod tests {
             poseidon_params_for_width(9)
         ));
 
-        // Prover facade smoke test
+        // Prover facade smoke test (single and pairs)
         let prover = MerkleProver::new(cfg.clone());
         let (root2, tree2) = prover.commit_pairs(&f_vals, &cp_vals);
         assert_eq!(root, root2);
         let (pairs2, proof2) = prover.open_pairs(&tree2, &f_vals, &cp_vals, &idx);
         assert_eq!(pairs, pairs2);
         assert!(prover.verify_pairs(&root2, &idx, &pairs2, &proof2));
+
+        // Single-column smoke test
+        let (root3, tree3) = prover.commit_single(&f_vals);
+        assert_eq!(root3, tree3.root());
+        let proof3 = prover.open_single(&tree3, &idx);
+        assert!(prover.verify_single(&root3, &idx, &idx.iter().map(|&i| f_vals[i]).collect::<Vec<_>>(), &proof3));
     }
 }
