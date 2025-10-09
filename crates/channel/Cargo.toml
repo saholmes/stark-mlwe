@@ -5,15 +5,16 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-ark-ff = { workspace = true }
+ark-ff = { version = "0.5", workspace = true }
 ark-serialize = "0.5"
-ark-pallas = "0.5"
+ark-pallas = { version = "0.5" }
 
 field = { path = "../field" }
 commitment = { path = "../commitment" }
 poseidon = { path = "../poseidon" }
 transcript = { path = "../transcript" }
 merkle = { path = "../merkle" }
+deep_ali = { path = "../deep_ali" } 
 
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

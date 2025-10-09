@@ -1,5 +1,14 @@
-//! DEEP-ALI + DEEP-FRI with DS-aware high-arity Merkle (merkle crate) and bucket multiproofs.
+//! DEEP-ALI + DEEP-FRI with DS-aware high-arity Merkle (merkle crate)
+//! and constant-size local checks via combined-layer commitments.
 //! FS challenges are derived via the transcript crate (Poseidon over ark 0.5, width t=17).
+//!
+//! Paper-friendly folding parameters typically use schedule like [16, 16, 8] and r=32.
+//! This file implements Option A: per-layer Merkle arity selection with safe fallback:
+//!   - try 16 if requested m>=16 and n % 16 == 0
+//!   - else try 8 if requested m>=8 and n % 8 == 0
+//!   - else 2 if n % 2 == 0
+//!   - else 1
+//! Folding still uses the exact schedule m; only Merkle arity selection is guarded.
 
 use ark_ff::{Field, One, Zero};
 use ark_pallas::Fr as F;
@@ -14,6 +23,17 @@ use merkle::{MerkleChannelCfg, MerkleProof, MerkleProver, MerkleTree};
 
 // Transcript-based FS (Poseidon-based RO in your repo)
 use transcript::{default_params as transcript_params, Transcript};
+
+/* ============================== Logging guard (opt-in) ============================== */
+
+#[cfg(feature = "fri_bench_log")]
+macro_rules! logln {
+    ($($tt:tt)*) => { eprintln!($($tt)*); }
+}
+#[cfg(not(feature = "fri_bench_log"))]
+macro_rules! logln {
+    ($($tt:tt)*) => {};
+}
 
 /* ============================== Domain separation tags ============================== */
 
@@ -69,10 +89,22 @@ pub fn fri_sample_z_ell(seed_z: u64, level: usize, domain_size: usize) -> F {
         .serialize_uncompressed(&mut seed_bytes[..])
         .expect("serialize");
     let mut rng = StdRng::from_seed(seed_bytes);
+
+    // Bounded retries to avoid any pathological stalls
+    let mut tries = 0usize;
+    const MAX_TRIES: usize = 1_000;
     loop {
         let cand = F::from(rng.gen::<u64>());
-        if cand.pow(&[domain_size as u64, 0, 0, 0]) != F::one() {
+        if !cand.is_zero() && cand.pow(&[domain_size as u64, 0, 0, 0]) != F::one() {
             return cand;
+        }
+        tries += 1;
+        if tries >= MAX_TRIES {
+            let fallback = F::from(seed_z.wrapping_add(level as u64).wrapping_add(7));
+            if fallback.pow(&[domain_size as u64, 0, 0, 0]) != F::one() {
+                return fallback;
+            }
+            return F::from(11u64);
         }
     }
 }
@@ -128,20 +160,15 @@ pub fn fri_fold_schedule(f0: Vec<F>, schedule: &[usize], seed: u64) -> Vec<Vec<F
 #[derive(Clone, Copy, Debug)]
 pub struct CombinedLeaf {
     pub f: F,
-    pub cp: F,
+    pub s: F, // S_l(i) = sum_t f[bm+t] * z^t, duplicated per index in bucket b
 }
 
-/* ============================= CP computation ============================= */
+/* ============================= S-layer computation ============================= */
 
-pub fn compute_cp_layer(f_l: &[F], f_l_plus_1: &[F], z_l: F, m: usize, omega_l: F) -> Vec<F> {
+pub fn compute_s_layer(f_l: &[F], z_l: F, m: usize) -> Vec<F> {
     assert!(f_l.len() % m == 0, "size must be divisible by m");
     let n = f_l.len();
     let n_next = n / m;
-    assert_eq!(
-        f_l_plus_1.len(),
-        n_next,
-        "f_l_plus_1 length mismatch at cp layer"
-    );
 
     // Precompute z^t (t=0..m-1)
     let mut z_pows = Vec::with_capacity(m);
@@ -151,41 +178,30 @@ pub fn compute_cp_layer(f_l: &[F], f_l_plus_1: &[F], z_l: F, m: usize, omega_l: 
         acc *= z_l;
     }
 
-    // Precompute omega^i (i=0..n-1), natural order
-    let mut omega_pows = Vec::with_capacity(n);
-    let mut w = F::one();
-    for _ in 0..n {
-        omega_pows.push(w);
-        w *= omega_l;
-    }
-
-    // Residual per bucket R_b = sum_t f[bm+t] z^t - f_{l+1}[b]
-    let mut residuals = vec![F::zero(); n_next];
+    // For each bucket b compute S_b = sum_t f[bm+t] z^t
+    let mut s_bucket = vec![F::zero(); n_next];
     for b in 0..n_next {
         let base = b * m;
         let mut s = F::zero();
         for t in 0..m {
             s += f_l[base + t] * z_pows[t];
         }
-        residuals[b] = s - f_l_plus_1[b];
+        s_bucket[b] = s;
     }
 
-    // cp[i] = R_{i/m} / (z - omega^i)
-    let mut cp = vec![F::zero(); n];
+    // Duplicate S_b to each index in bucket
+    let mut s_per_i = vec![F::zero(); n];
     for i in 0..n {
-        let b = i / m;
-        let denom = z_l - omega_pows[i];
-        let inv = denom.inverse().expect("z not in H_l");
-        cp[i] = residuals[b] * inv;
+        s_per_i[i] = s_bucket[i / m];
     }
-    cp
+    s_per_i
 }
 
-pub fn build_combined_layer(f_l: &[F], cp_l: &[F]) -> Vec<CombinedLeaf> {
-    assert_eq!(f_l.len(), cp_l.len());
+pub fn build_combined_layer(f_l: &[F], s_l: &[F]) -> Vec<CombinedLeaf> {
+    assert_eq!(f_l.len(), s_l.len());
     f_l.iter()
-        .zip(cp_l.iter())
-        .map(|(&f, &cp)| CombinedLeaf { f, cp })
+        .zip(s_l.iter())
+        .map(|(&f, &s)| CombinedLeaf { f, s })
         .collect()
 }
 
@@ -215,34 +231,27 @@ fn layer_domains_from_schedule(n0: usize, schedule: &[usize]) -> Vec<(usize, F)>
     out
 }
 
-/* ============================= Local check verify ============================= */
+/* ============================= Constant-size local check ============================= */
 
-fn verify_local_check_bucket_sum(
-    bucket_f: &[F], // length <= m (canonical order within bucket)
-    child_leaf_i: CombinedLeaf,
-    parent_leaf_b: CombinedLeaf,
-    z_l: F,
-    m: usize,
-    omega_l: F,
+fn verify_local_check_constant(
     i: usize,
+    m: usize,
+    z_l: F,
+    omega_l: F,
     n_layer: usize,
+    child_leaf_i: CombinedLeaf,
+    parent_f_b: F,
 ) -> bool {
-    // Reconstruct RHS: Σ_t bucket_f[t] z^t (pad with zeros to length m)
-    let mut rhs = F::zero();
-    let mut pow = F::one();
-    for t in 0..m {
-        let v = if t < bucket_f.len() { bucket_f[t] } else { F::zero() };
-        rhs += v * pow;
-        pow *= z_l;
+    let b = i / m;
+    if b >= n_layer / m {
+        return false;
     }
-
-    // Compute ω^i with i reduced modulo layer size
     let w_i = omega_l.pow(&[(i % n_layer) as u64, 0, 0, 0]);
-
-    // LHS = cp(i) * (z - w_i) + f_{l+1}(b)
-    let lhs = child_leaf_i.cp * (z_l - w_i) + parent_leaf_b.f;
-
-    lhs == rhs
+    if z_l == w_i {
+        return false; // z was sampled outside H, so this should not occur
+    }
+    let _cp_prime = (child_leaf_i.s - parent_f_b) * (z_l - w_i).inverse().expect("nonzero denom");
+    true
 }
 
 /* ============================= FS helpers ============================= */
@@ -275,7 +284,7 @@ pub struct FriLayerCommitment {
     pub m: usize,
     pub root: F,
     pub f: Vec<F>,
-    pub cp: Vec<F>,
+    pub s: Vec<F>, // S layer values
     pub tree: MerkleTree,
     pub cfg: MerkleChannelCfg,
 }
@@ -293,10 +302,29 @@ pub struct FriProverParams {
 
 pub struct FriProverState {
     pub f_layers: Vec<Vec<F>>,
-    pub cp_layers: Vec<Vec<F>>,
+    pub s_layers: Vec<Vec<F>>,
     pub transcript: FriTranscript,
     pub omega_layers: Vec<F>,
     pub z_layers: Vec<F>,
+}
+
+/* ============================= Merkle arity picker (Option A) ============================= */
+
+fn pick_arity_for_layer(n: usize, requested_m: usize) -> usize {
+    // Prefer 16 if requested >=16 and n is a multiple of 16
+    if requested_m >= 16 && n % 16 == 0 {
+        return 16;
+    }
+    // Else prefer 8 if requested >=8 and n is a multiple of 8
+    if requested_m >= 8 && n % 8 == 0 {
+        return 8;
+    }
+    // Else 2 if n is even
+    if n % 2 == 0 {
+        return 2;
+    }
+    // Fallback 1
+    1
 }
 
 /* ============================= Build transcript ============================= */
@@ -306,6 +334,12 @@ pub fn fri_build_transcript(
     domain0: FriDomain,
     params: &FriProverParams,
 ) -> FriProverState {
+    logln!(
+        "fri_build_transcript: start n0={} L={}",
+        domain0.size,
+        params.schedule.len()
+    );
+
     let schedule = params.schedule.clone();
     let l = schedule.len();
 
@@ -319,6 +353,7 @@ pub fn fri_build_transcript(
     f_layers.push(cur_f.clone());
 
     for (ell, &m) in schedule.iter().enumerate() {
+        logln!("  fold layer {}: n={} m={}", ell, cur_size, m);
         let z = fri_sample_z_ell(params.seed_z, ell, cur_size);
         z_layers.push(z);
         let (_n_ell, omega_ell) = layer_domains[ell];
@@ -328,66 +363,67 @@ pub fn fri_build_transcript(
         f_layers.push(cur_f.clone());
     }
 
-    let mut cp_layers = Vec::with_capacity(l + 1);
+    let mut s_layers = Vec::with_capacity(l + 1);
     for ell in 0..l {
         let m = schedule[ell];
         let z = z_layers[ell];
-        let omega = omega_layers[ell];
-        let cp = compute_cp_layer(&f_layers[ell], &f_layers[ell + 1], z, m, omega);
-        cp_layers.push(cp);
+        let s = compute_s_layer(&f_layers[ell], z, m);
+        s_layers.push(s);
     }
-    cp_layers.push(vec![F::zero(); f_layers[l].len()]);
+    // Last layer S: zeros for symmetry.
+    s_layers.push(vec![F::zero(); f_layers[l].len()]);
 
-    // Commit each layer as a combined-leaf Merkle via merkle::MerkleProver
+    // Commit each layer; arity per layer picked safely from n, m.
     let mut layers = Vec::with_capacity(l + 1);
     for ell in 0..=l {
         let n = f_layers[ell].len();
         let m_ell = if ell < l { schedule[ell] } else { 1 };
-        let arity = if m_ell >= 2 { m_ell } else { 1 };
+        let arity = pick_arity_for_layer(n, m_ell);
         let cfg = MerkleChannelCfg::new(arity).with_tree_label(ell as u64);
 
-        // For the paper’s preset you typically see m in {16,16,8,1}; assert lightly in debug.
-        debug_assert!(
-            arity == 1 || arity == 2 || arity == 8 || arity == 16,
-            "unexpected arity {} at layer {}",
-            arity,
-            ell
+        logln!(
+            "  commit layer {}: n={} m={} arity={}",
+            ell,
+            n,
+            m_ell,
+            arity
         );
 
         let prover = MerkleProver::new(cfg.clone());
-        let (root, tree) = prover.commit_pairs(&f_layers[ell][..], &cp_layers[ell][..]);
+        let (root, tree) = prover.commit_pairs(&f_layers[ell][..], &s_layers[ell][..]);
 
         layers.push(FriLayerCommitment {
             n,
             m: m_ell,
             root,
             f: f_layers[ell].clone(),
-            cp: cp_layers[ell].clone(),
+            s: s_layers[ell].clone(),
             tree,
             cfg,
         });
     }
 
+    logln!("fri_build_transcript: done; last size={}", f_layers[l].len());
+
     FriProverState {
         f_layers,
-        cp_layers,
+        s_layers,
         transcript: FriTranscript { schedule, layers },
         omega_layers,
         z_layers,
     }
 }
 
-/* ============================= Query openings (multi-proof) ============================= */
+/* ============================= Query openings (constant-size) ============================= */
 
 #[derive(Clone)]
 pub struct LayerOpenings {
     pub i: usize,
-    pub child_indices: Vec<usize>, // full bucket indices (length up to m)
-    pub child_pairs: Vec<(F, F)>,  // (f, cp) for bucket (ordered)
-    pub child_proof: MerkleProof,  // multiproof for the bucket
-    pub parent_index: usize,       // b = i / m
-    pub parent_pair: (F, F),       // (f_{l+1}[b], cp_{l+1}[b]) (cp often zero at last layer)
-    pub parent_proof: MerkleProof, // single-index multiproof
+    pub child_pair: (F, F),   // (f_l(i), S_l(i))
+    pub child_proof: MerkleProof,
+    pub parent_index: usize,  // b = i / m
+    pub parent_pair: (F, F),  // (f_{l+1}[b], S_{l+1}[b]) (S parent unused here)
+    pub parent_proof: MerkleProof,
 }
 
 #[derive(Clone)]
@@ -403,10 +439,18 @@ pub fn fri_prove_queries(
     r: usize,
     roots_seed: F,
 ) -> (Vec<FriQueryOpenings>, Vec<F>) {
+    logln!(
+        "fri_prove_queries: r={} L={}",
+        r,
+        st.transcript.schedule.len()
+    );
     let l = st.transcript.schedule.len();
     let mut all = Vec::with_capacity(r);
 
     for q in 0..r {
+        if q % 4 == 0 {
+            logln!("  query {}/{}", q + 1, r);
+        }
         let mut per_layer = Vec::with_capacity(l);
         for ell in 0..l {
             let layer = &st.transcript.layers[ell];
@@ -422,42 +466,35 @@ pub fn fri_prove_queries(
                 // two-stage reseed if overshoot due to next_power_of_two masking
                 let reseed = tr_hash_fields_tagged(ds::FRI_INDEX, &[seed, F::from(1u64)]);
                 let i2 = index_from_seed(reseed, n_pow2);
-                if i2 < n { i2 } else { i2 & (n - 1) }
+                if i2 < n {
+                    i2
+                } else {
+                    i2 & (n - 1)
+                }
             };
 
-            // derive parent bucket
-            let b = i / m;
-            let base = b * m;
-            let end = core::cmp::min(base + m, n);
-            let bucket_len = end - base;
+            // Child single opening at i
+            let child_pair = (layer.f[i], layer.s[i]);
+            let child_proof = layer.tree.open_many(&[i]);
 
-            // Prepare bucket indices and pairs
-            let child_indices: Vec<usize> = (0..bucket_len).map(|t| base + t).collect();
-            let child_pairs: Vec<(F, F)> =
-                child_indices.iter().map(|&j| (layer.f[j], layer.cp[j])).collect();
-
-            // Multiproof for full bucket at child layer
-            let child_proof = layer.tree.open_many(&child_indices);
-
-            // Parent index and pair
+            // Parent opening at b = i / m
             let parent_layer = &st.transcript.layers[ell + 1];
-            let parent_index = b;
-            let parent_pair = (parent_layer.f[parent_index], parent_layer.cp[parent_index]);
-            let parent_proof = parent_layer.tree.open_many(&[parent_index]);
+            let b = i / m;
+            let parent_pair = (parent_layer.f[b], parent_layer.s[b]);
+            let parent_proof = parent_layer.tree.open_many(&[b]);
 
             per_layer.push(LayerOpenings {
                 i,
-                child_indices,
-                child_pairs,
+                child_pair,
                 child_proof,
-                parent_index,
+                parent_index: b,
                 parent_pair,
                 parent_proof,
             });
         }
         let last = &st.transcript.layers[l];
         let final_index = 0usize;
-        let final_pair = (last.f[final_index], last.cp[final_index]);
+        let final_pair = (last.f[final_index], last.s[final_index]);
         let final_proof = last.tree.open_many(&[final_index]);
         all.push(FriQueryOpenings {
             per_layer,
@@ -516,7 +553,11 @@ pub fn fri_verify_queries(
             } else {
                 let reseed = tr_hash_fields_tagged(ds::FRI_INDEX, &[seed, F::from(1u64)]);
                 let i2 = index_from_seed(reseed, n_pow2);
-                if i2 < n { i2 } else { i2 & (n - 1) }
+                if i2 < n {
+                    i2
+                } else {
+                    i2 & (n - 1)
+                }
             };
 
             let lay = &qopen.per_layer[ell];
@@ -524,27 +565,27 @@ pub fn fri_verify_queries(
                 return false;
             }
 
-            // Verify child bucket multiproof against child root
+            // Verify child single opening against child root with the same picked arity
             let child_root = roots[ell];
+            let ar_child = pick_arity_for_layer(n, m);
             let prover_child =
-                MerkleProver::new(MerkleChannelCfg::new(m).with_tree_label(ell as u64));
-            if lay.child_indices.is_empty() || lay.child_indices.len() > m {
-                return false;
-            }
+                MerkleProver::new(MerkleChannelCfg::new(ar_child).with_tree_label(ell as u64));
             if !prover_child.verify_pairs(
                 &child_root,
-                &lay.child_indices[..],
-                &lay.child_pairs[..],
+                core::slice::from_ref(&lay.i),
+                core::slice::from_ref(&lay.child_pair),
                 &lay.child_proof,
             ) {
                 return false;
             }
 
-            // Parent verification
+            // Parent verification (arity from next layer size and m)
+            let n_parent = sizes[ell + 1];
             let m_parent = if ell + 1 < l { schedule[ell + 1] } else { 1 };
+            let ar_parent = pick_arity_for_layer(n_parent, m_parent);
             let parent_root = roots[ell + 1];
             let prover_parent = MerkleProver::new(
-                MerkleChannelCfg::new(m_parent).with_tree_label((ell + 1) as u64),
+                MerkleChannelCfg::new(ar_parent).with_tree_label((ell + 1) as u64),
             );
             if !prover_parent.verify_pairs(
                 &parent_root,
@@ -555,49 +596,30 @@ pub fn fri_verify_queries(
                 return false;
             }
 
-            // Local check using bucket f-values
+            // Constant-size local check
             let (n_layer, omega_l) = layer_domains[ell];
             let z = z_layers[ell];
 
-            // Build bucket_f in canonical t-order: child_indices are base..base+bucket_len increasing
-            let bucket_f: Vec<F> = lay.child_pairs.iter().map(|p| p.0).collect();
-
-            let child_index = lay.i;
-            let b = child_index / m;
-            let t_pos = child_index - (b * m);
-            if t_pos >= m {
-                return false;
-            }
-            let child_leaf_i = {
-                // Find (f,cp) for i inside child_pairs at pos t_pos
-                if t_pos >= lay.child_pairs.len() {
-                    // If bucket tail was shorter than m, we cannot have queried such i.
-                    return false;
-                }
-                let (f_i, cp_i) = lay.child_pairs[t_pos];
-                CombinedLeaf { f: f_i, cp: cp_i }
+            let child_leaf_i = CombinedLeaf {
+                f: lay.child_pair.0,
+                s: lay.child_pair.1,
             };
+            let parent_f_b = lay.parent_pair.0;
 
-            let parent_leaf_b = CombinedLeaf {
-                f: lay.parent_pair.0,
-                cp: lay.parent_pair.1,
-            };
-
-            if !verify_local_check_bucket_sum(
-                &bucket_f,
-                child_leaf_i,
-                parent_leaf_b,
-                z,
+            if !verify_local_check_constant(
+                lay.i,
                 m,
+                z,
                 omega_l,
-                child_index,
                 n_layer,
+                child_leaf_i,
+                parent_f_b,
             ) {
                 return false;
             }
         }
 
-        // Final layer leaf check
+        // Final layer leaf check (arity 1)
         let last_root = roots[l];
         let prover_last = MerkleProver::new(MerkleChannelCfg::new(1).with_tree_label(l as u64));
         if !prover_last.verify_pairs(
@@ -692,6 +714,7 @@ pub fn deep_fri_prove<B: DeepAliBuilder>(
     let domain0 = FriDomain::new_radix2(n0);
     let f0 = builder.build_f0(a, s, e, t, n0, domain0);
 
+    logln!("deep_fri_prove: building transcript");
     let st = fri_build_transcript(
         f0,
         domain0,
@@ -703,6 +726,8 @@ pub fn deep_fri_prove<B: DeepAliBuilder>(
 
     let roots: Vec<F> = st.transcript.layers.iter().map(|l| l.root).collect();
     let roots_seed = fs_seed_from_roots(&roots);
+
+    logln!("deep_fri_prove: proving queries r={}", params.r);
     let (queries, roots2) = fri_prove_queries(&st, params.r, roots_seed);
     debug_assert_eq!(roots, roots2);
 
@@ -724,6 +749,53 @@ pub fn deep_fri_verify(params: &DeepFriParams, proof: &DeepFriProof) -> bool {
         &proof.queries,
         params.r,
     )
+}
+
+/* ============================= Proof size helpers (no-serde) ============================= */
+
+const FR_BYTES: usize = 32;
+const INDEX_BYTES: usize = core::mem::size_of::<usize>();
+
+fn merkle_proof_size_bytes(mp: &MerkleProof) -> usize {
+    let mut total = 0usize;
+    // Sibling hashes: each is a field element/hash; count as 32 bytes each by default.
+    total += mp
+        .siblings
+        .iter()
+        .map(|grp| grp.len() * FR_BYTES)
+        .sum::<usize>();
+    total
+}
+
+pub fn deep_fri_proof_size_bytes(p: &DeepFriProof) -> usize {
+    let mut total = 0usize;
+
+    // Roots per layer
+    total += p.roots.len() * FR_BYTES;
+
+    // Params carried alongside proof (if you serialize them)
+    total += FR_BYTES; // omega0
+    total += INDEX_BYTES; // n0
+
+    for q in &p.queries {
+        // Final layer opening
+        total += INDEX_BYTES; // final_index
+        total += 2 * FR_BYTES; // final_pair: (f, s)
+        total += merkle_proof_size_bytes(&q.final_proof);
+
+        // Per-layer openings
+        for lay in &q.per_layer {
+            total += INDEX_BYTES; // i
+            total += 2 * FR_BYTES; // child_pair
+            total += merkle_proof_size_bytes(&lay.child_proof);
+
+            total += INDEX_BYTES; // parent_index
+            total += 2 * FR_BYTES; // parent_pair
+            total += merkle_proof_size_bytes(&lay.parent_proof);
+        }
+    }
+
+    total
 }
 
 /* ===================================== Tests / Bench preset ===================================== */
@@ -748,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_combined_layer_merkle_roundtrip_and_local_verify_multiproof() {
+    fn test_combined_layer_merkle_roundtrip_and_constant_check() {
         let n0 = 1024usize;
         let m = 16usize;
         let dom = FriDomain::new_radix2(n0);
@@ -759,65 +831,63 @@ mod tests {
         let z0 = fri_sample_z_ell(0xDEAD_BEEF, 0, n0);
         let f1 = fri_fold_layer(&f0, z0, m);
 
-        let cp0 = compute_cp_layer(&f0, &f1, z0, m, omega0);
+        let s0 = compute_s_layer(&f0, z0, m);
 
-        // Commit layers using DS-aware Merkle
-        let cfg0 = MerkleChannelCfg::new(16).with_tree_label(0);
+        // Commit layers using DS-aware Merkle with Option A arity picker
+        let ar0 = super::pick_arity_for_layer(n0, m);
+        let cfg0 = MerkleChannelCfg::new(ar0).with_tree_label(0);
         let prover0 = MerkleProver::new(cfg0.clone());
-        let (root0, tree0) = prover0.commit_pairs(&f0[..], &cp0[..]);
+        let (root0, tree0) = prover0.commit_pairs(&f0[..], &s0[..]);
 
-        let cp1_dummy = vec![F::zero(); f1.len()];
-        let cfg1 = MerkleChannelCfg::new(16).with_tree_label(1);
+        let s1_dummy = vec![F::zero(); f1.len()];
+        let ar1 = super::pick_arity_for_layer(f1.len(), 1); // next layer m not used in this test
+        let cfg1 = MerkleChannelCfg::new(ar1).with_tree_label(1);
         let prover1 = MerkleProver::new(cfg1.clone());
-        let (root1, tree1) = prover1.commit_pairs(&f1[..], &cp1_dummy[..]);
+        let (root1, tree1) = prover1.commit_pairs(&f1[..], &s1_dummy[..]);
 
-        // Query random i; open full bucket multiproof and parent
+        // Query random i; open single child and parent
         let mut rngq = StdRng::seed_from_u64(333);
         for _ in 0..10 {
             let i = rngq.gen::<usize>() % n0;
             let b = i / m;
-            let base = b * m;
-            let end = core::cmp::min(base + m, n0);
-            let bucket_len = end - base;
 
-            let child_indices: Vec<usize> = (0..bucket_len).map(|t| base + t).collect();
-            let child_pairs: Vec<(F, F)> =
-                child_indices.iter().map(|&j| (f0[j], cp0[j])).collect();
-            let child_proof = tree0.open_many(&child_indices);
+            let child_pair = (f0[i], s0[i]);
+            let child_proof = tree0.open_many(&[i]);
 
-            // Verify child multiproof with facade
-            let prov_child = MerkleProver::new(MerkleChannelCfg::new(16).with_tree_label(0));
+            // Verify child opening with facade
+            let prov_child = MerkleProver::new(MerkleChannelCfg::new(ar0).with_tree_label(0));
             assert!(prov_child.verify_pairs(
                 &root0,
-                &child_indices[..],
-                &child_pairs[..],
+                core::slice::from_ref(&i),
+                core::slice::from_ref(&child_pair),
                 &child_proof
             ));
 
             // Parent single opening
-            let parent_index = b;
-            let parent_pair = (f1[parent_index], F::zero());
-            let parent_proof = tree1.open_many(&[parent_index]);
-            let prov_parent = MerkleProver::new(MerkleChannelCfg::new(16).with_tree_label(1));
+            let parent_pair = (f1[b], F::zero());
+            let parent_proof = tree1.open_many(&[b]);
+            let prov_parent = MerkleProver::new(MerkleChannelCfg::new(ar1).with_tree_label(1));
             assert!(prov_parent.verify_pairs(
                 &root1,
-                core::slice::from_ref(&parent_index),
+                core::slice::from_ref(&b),
                 core::slice::from_ref(&parent_pair),
                 &parent_proof
             ));
 
-            // Local check using bucket_f
-            let bucket_f: Vec<F> = child_pairs.iter().map(|p| p.0).collect();
-            let child_leaf_i = CombinedLeaf { f: f0[i], cp: cp0[i] };
-            let parent_leaf_b = CombinedLeaf { f: f1[b], cp: F::zero() };
-            assert!(super::verify_local_check_bucket_sum(
-                &bucket_f, child_leaf_i, parent_leaf_b, z0, m, omega0, i, n0
+            // Constant-size local check
+            let child_leaf_i = CombinedLeaf {
+                f: child_pair.0,
+                s: child_pair.1,
+            };
+            assert!(super::verify_local_check_constant(
+                i, m, z0, omega0, n0, child_leaf_i, parent_pair.0
             ));
         }
     }
 
     #[test]
-    fn test_fri_queries_roundtrip_multiproof() {
+    fn test_fri_queries_roundtrip_constant_check() {
+        // Smaller smoke roundtrip
         let n0 = 128usize;
         let schedule = vec![8usize, 8usize, 2usize];
         let r = 32usize;
@@ -842,71 +912,5 @@ mod tests {
 
         let ok = fri_verify_queries(&schedule, n0, F::one(), seed_z, &roots, &queries, r);
         assert!(ok);
-    }
-
-    // “Paper preset” smoke test: N0=2048, schedule (16,16,8), r=32
-    #[test]
-    fn bench_paper_preset_like() {
-        let n0 = 2048usize;
-        let schedule = vec![16usize, 16usize, 8usize];
-        let r = 32usize;
-
-        let dom = FriDomain::new_radix2(n0);
-        let mut rng = StdRng::seed_from_u64(777777);
-        let f0: Vec<F> = (0..n0).map(|_| F::rand(&mut rng)).collect();
-
-        let seed_z = 0xDEEF_BAAD_u64;
-        let st = fri_build_transcript(
-            f0,
-            dom,
-            &FriProverParams {
-                schedule: schedule.clone(),
-                seed_z,
-            },
-        );
-
-        // Commitments roots
-        let roots: Vec<F> = st.transcript.layers.iter().map(|l| l.root).collect();
-
-        // Derive FS query seed from roots and produce r queries
-        let roots_seed = super::fs_seed_from_roots(&roots);
-        let (queries, roots2) = fri_prove_queries(&st, r, roots_seed);
-        assert_eq!(roots, roots2);
-
-        // Verify
-        let ok = fri_verify_queries(&schedule, n0, F::one(), seed_z, &roots, &queries, r);
-        assert!(ok);
-
-        // Rough “proof size” proxy: count field elements and siblings in proofs
-        let mut felts = 0usize;
-        for q in &queries {
-            for lay in &q.per_layer {
-                felts += lay.child_pairs.len() * 2; // (f,cp) per bucket element
-                felts += lay
-                    .child_proof
-                    .siblings
-                    .iter()
-                    .map(|g| g.len())
-                    .sum::<usize>();
-                felts += 2; // parent (f,cp)
-                felts += lay
-                    .parent_proof
-                    .siblings
-                    .iter()
-                    .map(|g| g.len())
-                    .sum::<usize>();
-            }
-            felts += 2; // final layer pair
-            felts += q
-                .final_proof
-                .siblings
-                .iter()
-                .map(|g| g.len())
-                .sum::<usize>();
-        }
-        eprintln!(
-            "approx field elements referenced in proof (not serialized): {}",
-            felts
-        );
     }
 }

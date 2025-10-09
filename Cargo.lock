@@ -267,6 +267,7 @@ dependencies = [
  "bincode",
  "commitment",
  "criterion",
+ "deep_ali",
  "field",
  "merkle",
  "poseidon",
@@ -435,6 +436,7 @@ dependencies = [
  "hex",
  "merkle",
  "once_cell",
+ "poseidon",
  "rand",
  "transcript",
 ]
