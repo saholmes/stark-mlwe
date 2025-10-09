@@ -73,6 +73,15 @@ impl DsLabel {
     }
 }
 
+// Map arity to supported Poseidon dynamic parameter profiles in this repo.
+// We only support t ∈ {9, 17}. Use:
+// - t = 9 for arity ≤ 8
+// - t = 17 for arity ≥ 16 (e.g., 16)
+fn params_for_arity(arity: usize) -> PoseidonParamsDynamic {
+    let t = if arity <= 8 { 9 } else { 17 };
+    poseidon_params_for_width(t)
+}
+
 // Parameterized Merkle configuration with explicit Poseidon params.
 #[derive(Clone)]
 pub struct MerkleChannelCfg {
@@ -91,7 +100,7 @@ impl MerkleChannelCfg {
     }
 
     pub fn new(arity: usize) -> Self {
-        let params = poseidon_params_for_width(arity + 1);
+        let params = params_for_arity(arity);
         Self {
             arity,
             params,
@@ -139,7 +148,20 @@ impl MerkleTree {
         levels.push(leaves);
 
         let t = cfg.params.t;
-        assert_eq!(t, arity + 1, "poseidon width t must equal arity + 1");
+        // Enforce supported profiles rather than t = arity + 1 for small arities.
+        if arity <= 8 {
+            assert_eq!(
+                t, 9,
+                "for arity <= 8, use t=9 Poseidon params; got t={}",
+                t
+            );
+        } else {
+            assert_eq!(
+                t, 17,
+                "for arity >= 16, use t=17 Poseidon params; got t={}",
+                t
+            );
+        }
 
         // Build levels using DS labels: level index starts at 0 for parents of leaves.
         let mut cur_level = 0u32;
@@ -372,7 +394,19 @@ impl MerkleTree {
         levels.push(level0);
 
         let t = cfg.params.t;
-        assert_eq!(t, arity + 1, "poseidon width t must equal arity + 1");
+        if arity <= 8 {
+            assert_eq!(
+                t, 9,
+                "for arity <= 8, use t=9 Poseidon params; got t={}",
+                t
+            );
+        } else {
+            assert_eq!(
+                t, 17,
+                "for arity >= 16, use t=17 Poseidon params; got t={}",
+                t
+            );
+        }
 
         let mut cur_level = 0u32; // 0 = parents of leaves
         while levels.last().unwrap().len() > 1 {
@@ -555,7 +589,10 @@ pub fn verify_many_ds(
         return false;
     }
     let arity = proof.arity;
-    if dyn_params.t != arity + 1 {
+
+    // Enforce the same supported-profile rule used by the tree.
+    let t = dyn_params.t;
+    if (arity <= 8 && t != 9) || (arity > 8 && t != 17) {
         return false;
     }
 
@@ -669,9 +706,12 @@ pub fn verify_pairs_ds(
         return false;
     }
     let arity = proof.arity;
-    if dyn_params.t != arity + 1 {
+
+    let t = dyn_params.t;
+    if (arity <= 8 && t != 9) || (arity > 8 && t != 17) {
         return false;
     }
+
     // Recompute leaf digests using the agreed DS policy (LEAF_LEVEL_DS).
     let leaves: Vec<F> = indices
         .iter()
@@ -1058,7 +1098,7 @@ mod tests {
         assert_ne!(parent_digest, d5, "shuffling children must change digest");
     }
 
-    // ========== Milestone 2 tests: combined-leaf (f, cp) encoded in one absorb ==========
+    // ========== Milestone 2 tests: combined-leaf (f, cp) encoded in one absorb) ==========
 
     #[test]
     fn test_combined_leaf_commit_open_legacy() {

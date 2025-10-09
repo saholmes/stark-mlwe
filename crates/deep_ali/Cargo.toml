@@ -7,22 +7,22 @@ description = "DEEP-ALI and FRI scaffolding"
 repository = "https://example.com/your/repo"
 
 [dependencies]
-ark-ff = "0.4"
-ark-poly = "0.4"
-ark-pallas = "0.4"
-ark-serialize = "0.4"
-ark-sponge = { version = "0.4.0-alpha" }
+ark-ff = "0.5"
+ark-poly = "0.5"
+ark-pallas = "0.5"
+ark-serialize = "0.5"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 blake3 = "1.5"
 once_cell = "1.19"
 hex = "0.4"
+merkle = { path = "../merkle" }
+transcript = { path = "../transcript" }
 
 [dev-dependencies]
-ark-ff = "0.4"
-ark-poly = "0.4"
-ark-pallas = "0.4"
-ark-serialize = "0.4"
-ark-sponge = { version = "0.4.0-alpha" }
+ark-ff = "0.5"
+ark-poly = "0.5"
+ark-pallas = "0.5"
+ark-serialize = "0.5"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 blake3 = "1.5"
 once_cell = "1.19"
