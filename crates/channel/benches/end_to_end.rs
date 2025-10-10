@@ -8,7 +8,8 @@ use channel::{build_vk_plain, prove_plain, verify_plain};
 
 // DEEP-ALI/FRI APIs live under deep_ali::fri
 use deep_ali::fri::{
-    deep_fri_prove, deep_fri_verify, deep_fri_proof_size_bytes, AliA, AliE, AliS, AliT, DeepAliMock,
+    deep_fri_prove, deep_fri_verify, deep_fri_proof_size_bytes, AliA, AliE, AliS, AliT,
+    DeepAliRealBuilder, // switched to the real builder
     DeepFriParams, DeepFriProof,
 };
 
@@ -84,7 +85,7 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
         let n0 = 1usize << k;
         g.throughput(Throughput::Elements(n0 as u64));
 
-        // Build a mock DEEP-ALI witness (replace with a real builder if available)
+        // Build a DEEP-ALI witness (synthetic here; replace with real if available)
         let mut rng = StdRng::seed_from_u64(1337);
         let a: AliA = (0..n0).map(|_| F::rand(&mut rng)).collect();
         let s: AliS = (0..n0).map(|_| F::rand(&mut rng)).collect();
@@ -96,7 +97,9 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
             r,
             seed_z,
         };
-        let builder = DeepAliMock;
+
+        // Use the real DEEP-ALI builder (no blinding by default)
+        let builder = DeepAliRealBuilder::default();
 
         eprintln!(
             "mf-fri setup: k={} (n0={}), schedule={:?}, r={}",

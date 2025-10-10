@@ -164,16 +164,14 @@ fn layer_domains_from_schedule(n0: usize, schedule: &[usize]) -> Vec<(usize, F)>
     out
 }
 
-fn verify_local_check_constant(
-    i: usize, m: usize, z_l: F, omega_l: F, n_layer: usize,
+// Fold-consistency local check: enforce s_i == f_parent[b]
+fn verify_local_check_fold(
+    i: usize, m: usize, n_layer: usize,
     child_leaf_i: CombinedLeaf, parent_f_b: F,
 ) -> bool {
     let b = i / m;
     if b >= n_layer / m { return false; }
-    let w_i = omega_l.pow(&[(i % n_layer) as u64, 0, 0, 0]);
-    if z_l == w_i { return false; }
-    let _cp_prime = (child_leaf_i.s - parent_f_b) * (z_l - w_i).inverse().expect("nonzero denom");
-    true
+    child_leaf_i.s == parent_f_b
 }
 
 fn fs_seed_from_roots(roots: &[F]) -> F { tr_hash_fields_tagged(ds::FRI_SEED, roots) }
@@ -487,7 +485,81 @@ impl DeepAliBuilder for DeepAliMock {
     }
 }
 
-// Per-query payload now carries all field elements needed to recompute leaves.
+// Real DEEP-ALI builder using lib.rs merge helpers
+pub struct DeepAliRealBuilder {
+    pub r_eval_opt: Option<Vec<F>>, // optional blinding evaluations R on H
+    pub use_blinding: bool,
+    pub ds_tag: &'static [u8],       // domain-separation tag for (z, beta)
+}
+
+impl Default for DeepAliRealBuilder {
+    fn default() -> Self {
+        Self { r_eval_opt: None, use_blinding: false, ds_tag: b"ALI/DEEP" }
+    }
+}
+
+// Deterministically derive (z, beta) for DEEP-ALI from a seed
+fn ali_sample_z_beta_fs(tag: &[u8], n0: usize, roots_seed: F) -> (F, F) {
+    let fused = tr_hash_fields_tagged(tag, &[roots_seed, F::from(n0 as u64)]);
+    let mut seed_bytes = [0u8; 32];
+    fused.serialize_uncompressed(&mut seed_bytes[..]).expect("serialize");
+    let mut rng = StdRng::from_seed(seed_bytes);
+    let beta = F::from(rng.gen::<u64>());
+    let mut tries = 0usize;
+    const MAX_TRIES: usize = 1_000;
+    loop {
+        let cand = F::from(rng.gen::<u64>());
+        if !cand.is_zero() && cand.pow(&[n0 as u64, 0, 0, 0]) != F::one() {
+            return (cand, beta);
+        }
+        tries += 1;
+        if tries >= MAX_TRIES {
+            let fallback = roots_seed + F::from(17u64);
+            if fallback.pow(&[n0 as u64, 0, 0, 0]) != F::one() {
+                return (fallback, beta);
+            }
+            return (F::from(19u64), beta);
+        }
+    }
+}
+
+impl DeepAliBuilder for DeepAliRealBuilder {
+    fn build_f0(
+        &self,
+        a: &AliA, s: &AliS, e: &AliE, t: &AliT,
+        n0: usize, domain: FriDomain,
+    ) -> Vec<F> {
+        use crate::{deep_ali_merge_evals, deep_ali_merge_evals_blinded};
+        assert_eq!(a.len(), n0);
+        assert_eq!(s.len(), n0);
+        assert_eq!(e.len(), n0);
+        assert_eq!(t.len(), n0);
+
+        // FS-style seed from public ALI inputs
+        let seed_f = tr_hash_fields_tagged(
+            b"ALI/seed",
+            &[
+                tr_hash_fields_tagged(b"ALI/A", a),
+                tr_hash_fields_tagged(b"ALI/S", s),
+                tr_hash_fields_tagged(b"ALI/E", e),
+                tr_hash_fields_tagged(b"ALI/T", t),
+                F::from(n0 as u64),
+            ],
+        );
+
+        let (z, beta) = ali_sample_z_beta_fs(self.ds_tag, n0, seed_f);
+        let r_eval_opt_slice = self.r_eval_opt.as_ref().map(|v| &v[..]);
+
+        let (f0_eval, _z_out, _c_star) = if self.use_blinding {
+            deep_ali_merge_evals_blinded(a, s, e, t, r_eval_opt_slice, beta, domain.omega, z)
+        } else {
+            deep_ali_merge_evals(a, s, e, t, domain.omega, z)
+        };
+
+        f0_eval
+    }
+}
+
 #[derive(Clone)]
 pub struct LayerOpenPayload {
     pub f_i: F,
@@ -640,22 +712,17 @@ pub fn deep_fri_verify(params: &DeepFriParams, proof: &DeepFriProof) -> bool {
         }
     }
 
-    // Local checks across queries
+    // Local checks across queries: enforce s_i == f_parent[b]
     let layer_domains = layer_domains_from_schedule(proof.n0, &params.schedule);
-    let mut z_layers = Vec::with_capacity(L);
-    for ell in 0..L {
-        z_layers.push(fri_sample_z_ell(params.seed_z, ell, sizes[ell]));
-    }
     for q in 0..params.r {
         let qp = &proof.queries[q];
         for ell in 0..L {
             let rref = &qp.per_layer_refs[ell];
             let pay = &qp.per_layer_payloads[ell];
-            let (n_layer, omega_l) = layer_domains[ell];
-            let z = z_layers[ell];
+            let (n_layer, _omega_l) = layer_domains[ell];
 
             let child_leaf_i = CombinedLeaf { f: pay.f_i, s: pay.s_i };
-            if !verify_local_check_constant(rref.i, params.schedule[ell], z, omega_l, n_layer, child_leaf_i, pay.f_parent_b) {
+            if !verify_local_check_fold(rref.i, params.schedule[ell], n_layer, child_leaf_i, pay.f_parent_b) {
                 return false;
             }
         }
