@@ -62,7 +62,7 @@ fn bench_e2e_plain(c: &mut Criterion) {
 }
 
 // Toggle presets for MF-FRI
-const USE_PAPER_PRESET: bool = false; // set to true to try schedule [16,16,8], r=32
+const USE_PAPER_PRESET: bool = true; // set to true to try schedule [16,16,8], r=32
 
 fn bench_e2e_mf_fri(c: &mut Criterion) {
     let mut g = c.benchmark_group("e2e_mf_fri");
@@ -80,7 +80,7 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
 
     let seed_z = 0xDEEF_BAAD_u64;
 
-    for &k in &[12usize, 14] {
+    for &k in &[11usize, 12, 13, 14, 15, 16] {
         let n0 = 1usize << k;
         g.throughput(Throughput::Elements(n0 as u64));
 
