@@ -1,8 +1,8 @@
 use ark_pallas::Fr as F;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Compress, Validate};
 use poseidon::{
-    hash_with_ds, hash_with_ds_dynamic, params::generate_params_t17_x5, poseidon_params_for_width,
-    PoseidonParams, PoseidonParamsDynamic,
+    hash_with_ds, hash_with_ds_dynamic, params::generate_params_t17_x5,
+    poseidon_params_for_arity, poseidon_params_for_width, PoseidonParams, PoseidonParamsDynamic,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -73,13 +73,10 @@ impl DsLabel {
     }
 }
 
-// Map arity to supported Poseidon dynamic parameter profiles in this repo.
-// We only support t ∈ {9, 17}. Use:
-// - t = 9 for arity ≤ 8
-// - t = 17 for arity ≥ 16 (e.g., 16)
+// Updated: delegate arity→Poseidon width mapping to poseidon::poseidon_params_for_arity.
+// Supports arities up to 64 (t ∈ {9, 17, 33, 65}).
 fn params_for_arity(arity: usize) -> PoseidonParamsDynamic {
-    let t = if arity <= 8 { 9 } else { 17 };
-    poseidon_params_for_width(t)
+    poseidon_params_for_arity(arity)
 }
 
 // Parameterized Merkle configuration with explicit Poseidon params.
@@ -154,12 +151,13 @@ impl MerkleTree {
         let mut levels: Vec<Vec<F>> = Vec::new();
         levels.push(leaves);
 
+        // Extended width checks: arity bucket must match t ∈ {9, 17, 33, 65}
         let t = cfg.params.t;
-        if arity <= 8 {
-            assert_eq!(t, 9, "for arity <= 8, use t=9 Poseidon params; got t={}", t);
-        } else {
-            assert_eq!(t, 17, "for arity >= 16, use t=17 Poseidon params; got t={}", t);
-        }
+        let ok_width = (arity <= 8 && t == 9)
+            || (arity >= 9 && arity <= 16 && t == 17)
+            || (arity >= 17 && arity <= 32 && t == 33)
+            || (arity >= 33 && arity <= 64 && t == 65);
+        assert!(ok_width, "arity {} incompatible with Poseidon width t={}", arity, t);
 
         let mut cur_level = 0u32;
         while levels.last().unwrap().len() > 1 {
@@ -404,12 +402,13 @@ impl MerkleTree {
         let mut levels: Vec<Vec<F>> = Vec::new();
         levels.push(level0);
 
+        // Extended width checks for pairs path
         let t = cfg.params.t;
-        if arity <= 8 {
-            assert_eq!(t, 9, "for arity <= 8, use t=9 Poseidon params; got t={}", t);
-        } else {
-            assert_eq!(t, 17, "for arity >= 16, use t=17 Poseidon params; got t={}", t);
-        }
+        let ok_width = (arity <= 8 && t == 9)
+            || (arity >= 9 && arity <= 16 && t == 17)
+            || (arity >= 17 && arity <= 32 && t == 33)
+            || (arity >= 33 && arity <= 64 && t == 65);
+        assert!(ok_width, "arity {} incompatible with Poseidon width t={}", arity, t);
 
         let mut cur_level = 0u32; // 0 = parents of leaves
         while levels.last().unwrap().len() > 1 {
@@ -605,8 +604,13 @@ pub fn verify_many_ds(
     }
     let arity = proof.arity;
 
+    // Extended width guard
     let t = dyn_params.t;
-    if (arity <= 8 && t != 9) || (arity > 8 && t != 17) {
+    let ok_width = (arity <= 8 && t == 9)
+        || (arity >= 9 && arity <= 16 && t == 17)
+        || (arity >= 17 && arity <= 32 && t == 33)
+        || (arity >= 33 && arity <= 64 && t == 65);
+    if !ok_width {
         return false;
     }
 
@@ -726,8 +730,13 @@ pub fn verify_pairs_ds(
     }
     let arity = proof.arity;
 
+    // Extended width guard
     let t = dyn_params.t;
-    if (arity <= 8 && t != 9) || (arity > 8 && t != 17) {
+    let ok_width = (arity <= 8 && t == 9)
+        || (arity >= 9 && arity <= 16 && t == 17)
+        || (arity >= 17 && arity <= 32 && t == 33)
+        || (arity >= 33 && arity <= 64 && t == 65);
+    if !ok_width {
         return false;
     }
 

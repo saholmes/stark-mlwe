@@ -3,7 +3,7 @@ use ark_pallas::Fr as F;
 use utils::fr_from_hash;
 
 // Poseidon permutation parameters for benchmarking and M1 scaffolding.
-// Width t=17 matches Merkle arity m=16 with capacity c=1.
+// Default static width t=17 matches Merkle arity m=16 with capacity c=1.
 pub const T: usize = 17;       // state width = rate(16) + capacity(1)
 pub const RATE: usize = 16;
 pub const CAPACITY: usize = 1;
@@ -99,29 +99,31 @@ pub fn hash_with_ds(inputs: &[F], ds_tag: F, params: &PoseidonParams) -> F {
     state[0]
 }
 
-// ========= Milestone 1 additions: dynamic width support and params builder =========
+// ========= Dynamic width support and params builder =========
 
 #[derive(Clone, Debug)]
 pub struct PoseidonParamsDynamic {
     pub t: usize,                 // state width
     pub rate: usize,              // rate = t - 1 (capacity = 1)
     pub rounds_full: usize,       // RF = 8
-    pub rounds_partial: usize,    // RP = 64 (t=17) or 60 (t=9)
+    pub rounds_partial: usize,    // RP depends on t
     pub alpha: u64,               // 5
     pub mds: Vec<Vec<F>>,         // t x t
     pub rc_full: Vec<Vec<F>>,     // RF x t
     pub rc_partial: Vec<F>,       // RP elements
 }
 
-/// Build Poseidon parameters for width t with alpha=5, RF=8, RP in {64,60}.
-/// Supported widths: t = 17 (m=16), t = 9 (m=8).
+/// Build Poseidon parameters for width t with alpha=5, RF=8.
+/// Supported widths (now extended): t ∈ {9, 17, 33, 65}  => arity m = t-1 ∈ {8, 16, 32, 64}.
 /// Uses deterministic fr_from_hash-based derivation for stability.
-/// Swap in audited constants when ready without changing the signature.
+/// RP values chosen conservatively; adjust if you import audited constants.
 pub fn poseidon_params_for_width(t: usize) -> PoseidonParamsDynamic {
     let (rf, rp) = match t {
-        17 => (8usize, 64usize),
-        9 => (8usize, 60usize),
-        _ => panic!("unsupported Poseidon width t={t}; supported t ∈ {{17, 9}}"),
+        9  => (8usize, 60usize), // m=8
+        17 => (8usize, 64usize), // m=16
+        33 => (8usize, 68usize), // m=32  (conservative)
+        65 => (8usize, 76usize), // m=64  (conservative)
+        _ => panic!("unsupported Poseidon width t={t}; supported t ∈ {{9, 17, 33, 65}}"),
     };
     let rate = t - 1;
     let seed = seed_for_t(t);
@@ -140,6 +142,24 @@ pub fn poseidon_params_for_width(t: usize) -> PoseidonParamsDynamic {
         rc_full,
         rc_partial,
     }
+}
+
+/// Helper: map Merkle arity m to a supported Poseidon width t = m + 1.
+/// Supported ranges:
+/// - m ∈ [2..=8]   -> t = 9
+/// - m ∈ [9..=16]  -> t = 17
+/// - m ∈ [17..=32] -> t = 33
+/// - m ∈ [33..=64] -> t = 65
+pub fn poseidon_params_for_arity(arity: usize) -> PoseidonParamsDynamic {
+    let t = match arity {
+        0 | 1 => 9,            // degenerate, treat as ≤ 8
+        2..=8 => 9,
+        9..=16 => 17,
+        17..=32 => 33,
+        33..=64 => 65,
+        _ => panic!("unsupported Merkle arity {arity}; max supported = 64"),
+    };
+    poseidon_params_for_width(t)
 }
 
 fn seed_for_t(t: usize) -> Vec<u8> {
@@ -192,7 +212,7 @@ fn derive_rc_partial(seed: &[u8], rp: usize) -> Vec<F> {
     rc
 }
 
-/// Generic permutation for dynamic params (t ∈ {9, 17}).
+/// Generic permutation for dynamic params (t ∈ {9, 17, 33, 65}).
 pub fn permute_dynamic(state: &mut [F], params: &PoseidonParamsDynamic) {
     let t = params.t;
     assert_eq!(state.len(), t);
@@ -428,5 +448,31 @@ mod tests {
         assert_eq!(p_back.mds[0][0], p_static.mds[0][0]);
         assert_eq!(p_back.rc_full[0][0], p_static.rc_full[0][0]);
         assert_eq!(p_back.rc_partial[0], p_static.rc_partial[0]);
+    }
+
+    #[test]
+    fn params_exist_for_supported_widths() {
+        for &t in &[9usize, 17, 33, 65] {
+            let p = poseidon_params_for_width(t);
+            assert_eq!(p.t, t);
+            assert_eq!(p.rate, t - 1);
+            assert_eq!(p.rounds_full, 8);
+            assert!(p.rounds_partial > 0);
+            assert_eq!(p.mds.len(), t);
+            assert_eq!(p.mds[0].len(), t);
+            assert_eq!(p.rc_full.len(), 8);
+            assert_eq!(p.rc_full[0].len(), t);
+            assert_eq!(p.rc_partial.len(), p.rounds_partial);
+        }
+    }
+
+    #[test]
+    fn arity_mapping_helper() {
+        // spot checks
+        assert_eq!(poseidon_params_for_arity(2).t, 9);
+        assert_eq!(poseidon_params_for_arity(8).t, 9);
+        assert_eq!(poseidon_params_for_arity(16).t, 17);
+        assert_eq!(poseidon_params_for_arity(32).t, 33);
+        assert_eq!(poseidon_params_for_arity(64).t, 65);
     }
 }
