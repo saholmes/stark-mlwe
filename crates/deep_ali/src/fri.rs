@@ -81,6 +81,7 @@ pub fn fri_sample_z_ell(seed_z: u64, level: usize, domain_size: usize) -> F {
     }
 }
 
+// Generic m-ary fold; supports m=2,4,8,16,32,64,128…
 pub fn fri_fold_layer(f_l: &[F], z_l: F, m: usize) -> Vec<F> {
     assert!(m >= 2);
     assert!(f_l.len() % m == 0, "layer size must be divisible by m");
@@ -214,9 +215,15 @@ pub struct FriProverState {
     pub z_layers: Vec<F>,
 }
 
+// Prefer large Merkle arity (up to 128) when it divides the layer size.
+// Fall back to 16, 8, then 2; 1 only as a last resort (shouldn’t happen except at n=1).
 fn pick_arity_for_layer(n: usize, requested_m: usize) -> usize {
-    if requested_m >= 16 && n % 16 == 0 { return 16; }
-    if requested_m >= 8 && n % 8 == 0 { return 8; }
+    if requested_m >= 128 && n % 128 == 0 { return 128; }
+    if requested_m >= 64  && n % 64  == 0 { return 64; }
+    if requested_m >= 32  && n % 32  == 0 { return 32; }
+    if requested_m >= 16  && n % 16  == 0 { return 16; }
+    if requested_m >= 8   && n % 8   == 0 { return 8; }
+    if requested_m >= 4   && n % 4   == 0 { return 4; }
     if n % 2 == 0 { return 2; }
     1
 }
@@ -263,7 +270,9 @@ pub fn fri_build_transcript(
         let n = f_layers[ell].len();
         let m_ell = if ell < l { schedule[ell] } else { 1 };
         let arity = pick_arity_for_layer(n, m_ell);
-        let use_hashed = arity == 16 || arity == 8;
+
+        // Heuristic: hashed single-column commitment for higher Merkle arities (>=8).
+        let use_hashed = matches!(arity, 128 | 64 | 32 | 16 | 8);
 
         let cfg = MerkleChannelCfg::new(arity).with_tree_label(ell as u64);
         let prover = MerkleProver::new(cfg.clone());
@@ -276,7 +285,7 @@ pub fn fri_build_transcript(
             logln!("  committed layer {}: n={} m={} arity={} hashed=1(single)", ell, n, m_ell, arity);
             (root, tree)
         } else {
-            // For small arities, keep pair-commit of (f, s)
+            // For smaller arities, keep pair-commit of (f, s)
             let (root, tree) = prover.commit_pairs(&f_layers[ell][..], &s_layers[ell][..]);
             logln!("  committed layer {}: n={} m={} arity={} hashed=0(pairs)", ell, n, m_ell, arity);
             (root, tree)
@@ -663,7 +672,7 @@ pub fn deep_fri_verify(params: &DeepFriParams, proof: &DeepFriProof) -> bool {
 
         // Child layer verification
         let ar_child = pick_arity_for_layer(sizes[ell], params.schedule[ell]);
-        let hashed_child = ar_child == 16 || ar_child == 8;
+        let hashed_child = matches!(ar_child, 128 | 64 | 32 | 16 | 8);
         let prover_child = MerkleProver::new(MerkleChannelCfg::new(ar_child).with_tree_label(ell as u64));
 
         if hashed_child {
@@ -688,7 +697,7 @@ pub fn deep_fri_verify(params: &DeepFriParams, proof: &DeepFriProof) -> bool {
 
         // Parent layer verification (against root at ell+1)
         let ar_parent = pick_arity_for_layer(sizes[ell + 1], if ell + 1 < L { params.schedule[ell + 1] } else { 1 });
-        let hashed_parent = ar_parent == 16 || ar_parent == 8;
+        let hashed_parent = matches!(ar_parent, 128 | 64 | 32 | 16 | 8);
         let prover_parent = MerkleProver::new(MerkleChannelCfg::new(ar_parent).with_tree_label((ell + 1) as u64));
 
         if hashed_parent {
@@ -732,7 +741,7 @@ pub fn deep_fri_verify(params: &DeepFriParams, proof: &DeepFriProof) -> bool {
     {
         let last_root = proof.roots[L];
         let ar_last = pick_arity_for_layer(sizes[L], 1);
-        let hashed_last = ar_last == 16 || ar_last == 8;
+        let hashed_last = matches!(ar_last, 128 | 64 | 32 | 16 | 8);
         let prover_last = MerkleProver::new(MerkleChannelCfg::new(ar_last).with_tree_label(L as u64));
         let final_idx = proof.queries[0].final_index; // should be 0
         if final_idx != 0 { return false; }

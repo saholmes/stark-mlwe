@@ -74,7 +74,7 @@ impl DsLabel {
 }
 
 // Updated: delegate arity→Poseidon width mapping to poseidon::poseidon_params_for_arity.
-// Supports arities up to 64 (t ∈ {9, 17, 33, 65}).
+// Supports arities up to 128 (t ∈ {9, 17, 33, 65, 129}).
 fn params_for_arity(arity: usize) -> PoseidonParamsDynamic {
     poseidon_params_for_arity(arity)
 }
@@ -151,12 +151,13 @@ impl MerkleTree {
         let mut levels: Vec<Vec<F>> = Vec::new();
         levels.push(leaves);
 
-        // Extended width checks: arity bucket must match t ∈ {9, 17, 33, 65}
+        // Extended width checks: arity bucket must match t ∈ {9, 17, 33, 65, 129}
         let t = cfg.params.t;
         let ok_width = (arity <= 8 && t == 9)
             || (arity >= 9 && arity <= 16 && t == 17)
             || (arity >= 17 && arity <= 32 && t == 33)
-            || (arity >= 33 && arity <= 64 && t == 65);
+            || (arity >= 33 && arity <= 64 && t == 65)
+            || (arity >= 65 && arity <= 128 && t == 129);
         assert!(ok_width, "arity {} incompatible with Poseidon width t={}", arity, t);
 
         let mut cur_level = 0u32;
@@ -402,12 +403,13 @@ impl MerkleTree {
         let mut levels: Vec<Vec<F>> = Vec::new();
         levels.push(level0);
 
-        // Extended width checks for pairs path
+        // Extended width checks for pairs path (t ∈ {9, 17, 33, 65, 129})
         let t = cfg.params.t;
         let ok_width = (arity <= 8 && t == 9)
             || (arity >= 9 && arity <= 16 && t == 17)
             || (arity >= 17 && arity <= 32 && t == 33)
-            || (arity >= 33 && arity <= 64 && t == 65);
+            || (arity >= 33 && arity <= 64 && t == 65)
+            || (arity >= 65 && arity <= 128 && t == 129);
         assert!(ok_width, "arity {} incompatible with Poseidon width t={}", arity, t);
 
         let mut cur_level = 0u32; // 0 = parents of leaves
@@ -609,7 +611,8 @@ pub fn verify_many_ds(
     let ok_width = (arity <= 8 && t == 9)
         || (arity >= 9 && arity <= 16 && t == 17)
         || (arity >= 17 && arity <= 32 && t == 33)
-        || (arity >= 33 && arity <= 64 && t == 65);
+        || (arity >= 33 && arity <= 64 && t == 65)
+        || (arity >= 65 && arity <= 128 && t == 129);
     if !ok_width {
         return false;
     }
@@ -735,7 +738,8 @@ pub fn verify_pairs_ds(
     let ok_width = (arity <= 8 && t == 9)
         || (arity >= 9 && arity <= 16 && t == 17)
         || (arity >= 17 && arity <= 32 && t == 33)
-        || (arity >= 33 && arity <= 64 && t == 65);
+        || (arity >= 33 && arity <= 64 && t == 65)
+        || (arity >= 65 && arity <= 128 && t == 129);
     if !ok_width {
         return false;
     }

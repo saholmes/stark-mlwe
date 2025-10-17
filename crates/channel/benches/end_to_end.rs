@@ -189,7 +189,8 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
 
     // k window
     let k_lo = 11usize;
-    let k_hi = 16usize;
+    // bump high end so schedules with 128 have room (k must be ≥ 7 + …)
+    let k_hi = 19usize;
 
     // Presets: keep "paper" first so baseline is available for all ks
     let presets: &[(&str, &[usize])] = &[
@@ -199,6 +200,14 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
         ("uni64x2x8", &[64, 64, 8]),
         ("hi64_32_8", &[64, 32, 8]),
         ("hi32_32_16", &[32, 32, 16]),
+        // New: schedules using 128-fold layers
+        ("uni128", &[128]),
+        ("uni128x2", &[128, 128]),
+        ("hi128_64", &[128, 64]),
+        ("hi128_32", &[128, 32]),
+        ("hi128_16", &[128, 16]),
+        ("hi128_64_8", &[128, 64, 8]),
+        ("hi128_32_8", &[128, 32, 8]),
     ];
 
     // Deterministic input generation

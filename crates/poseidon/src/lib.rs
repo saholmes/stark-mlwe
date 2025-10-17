@@ -114,16 +114,17 @@ pub struct PoseidonParamsDynamic {
 }
 
 /// Build Poseidon parameters for width t with alpha=5, RF=8.
-/// Supported widths (now extended): t ∈ {9, 17, 33, 65}  => arity m = t-1 ∈ {8, 16, 32, 64}.
+/// Supported widths (now extended): t ∈ {9, 17, 33, 65, 129}  => arity m = t-1 ∈ {8, 16, 32, 64, 128}.
 /// Uses deterministic fr_from_hash-based derivation for stability.
 /// RP values chosen conservatively; adjust if you import audited constants.
 pub fn poseidon_params_for_width(t: usize) -> PoseidonParamsDynamic {
     let (rf, rp) = match t {
-        9  => (8usize, 60usize), // m=8
-        17 => (8usize, 64usize), // m=16
-        33 => (8usize, 68usize), // m=32  (conservative)
-        65 => (8usize, 76usize), // m=64  (conservative)
-        _ => panic!("unsupported Poseidon width t={t}; supported t ∈ {{9, 17, 33, 65}}"),
+        9   => (8usize, 60usize), // m=8
+        17  => (8usize, 64usize), // m=16
+        33  => (8usize, 68usize), // m=32  (conservative)
+        65  => (8usize, 76usize), // m=64  (conservative)
+        129 => (8usize, 84usize), // m=128 (conservative)
+        _ => panic!("unsupported Poseidon width t={t}; supported t ∈ {{9, 17, 33, 65, 129}}"),
     };
     let rate = t - 1;
     let seed = seed_for_t(t);
@@ -146,18 +147,20 @@ pub fn poseidon_params_for_width(t: usize) -> PoseidonParamsDynamic {
 
 /// Helper: map Merkle arity m to a supported Poseidon width t = m + 1.
 /// Supported ranges:
-/// - m ∈ [2..=8]   -> t = 9
-/// - m ∈ [9..=16]  -> t = 17
-/// - m ∈ [17..=32] -> t = 33
-/// - m ∈ [33..=64] -> t = 65
+/// - m ∈ [2..=8]     -> t = 9
+/// - m ∈ [9..=16]    -> t = 17
+/// - m ∈ [17..=32]   -> t = 33
+/// - m ∈ [33..=64]   -> t = 65
+/// - m ∈ [65..=128]  -> t = 129
 pub fn poseidon_params_for_arity(arity: usize) -> PoseidonParamsDynamic {
     let t = match arity {
-        0 | 1 => 9,            // degenerate, treat as ≤ 8
-        2..=8 => 9,
-        9..=16 => 17,
-        17..=32 => 33,
-        33..=64 => 65,
-        _ => panic!("unsupported Merkle arity {arity}; max supported = 64"),
+        0 | 1       => 9,   // degenerate, treat as ≤ 8
+        2..=8       => 9,
+        9..=16      => 17,
+        17..=32     => 33,
+        33..=64     => 65,
+        65..=128    => 129,
+        _ => panic!("unsupported Merkle arity {arity}; max supported = 128"),
     };
     poseidon_params_for_width(t)
 }
@@ -212,7 +215,7 @@ fn derive_rc_partial(seed: &[u8], rp: usize) -> Vec<F> {
     rc
 }
 
-/// Generic permutation for dynamic params (t ∈ {9, 17, 33, 65}).
+/// Generic permutation for dynamic params (t ∈ {9, 17, 33, 65, 129}).
 pub fn permute_dynamic(state: &mut [F], params: &PoseidonParamsDynamic) {
     let t = params.t;
     assert_eq!(state.len(), t);
@@ -452,7 +455,7 @@ mod tests {
 
     #[test]
     fn params_exist_for_supported_widths() {
-        for &t in &[9usize, 17, 33, 65] {
+        for &t in &[9usize, 17, 33, 65, 129] {
             let p = poseidon_params_for_width(t);
             assert_eq!(p.t, t);
             assert_eq!(p.rate, t - 1);
@@ -474,5 +477,6 @@ mod tests {
         assert_eq!(poseidon_params_for_arity(16).t, 17);
         assert_eq!(poseidon_params_for_arity(32).t, 33);
         assert_eq!(poseidon_params_for_arity(64).t, 65);
+        assert_eq!(poseidon_params_for_arity(128).t, 129);
     }
 }
